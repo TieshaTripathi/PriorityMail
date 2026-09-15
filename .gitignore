@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+package-lock.json.bak
+yarn.lock.bak
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# Native builds
+*.orig.*
+android/
+ios/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
