@@ -47,13 +47,28 @@ function getClientCredentials() {
   return { clientId, clientSecret };
 }
 
+export function getLoginRedirectUri(): string {
+  return (
+    process.env.GOOGLE_AUTH_REDIRECT_URI ||
+    process.env.GOOGLE_REDIRECT_URI ||
+    'http://localhost:4000/api/auth/google/callback'
+  );
+}
+
+export function getGmailRedirectUri(): string {
+  return (
+    process.env.GOOGLE_GMAIL_REDIRECT_URI ||
+    process.env.GMAIL_REDIRECT_URI ||
+    'http://localhost:4000/api/accounts/google/callback'
+  );
+}
+
 /**
  * Build an OAuth2 URL for user login (identity scopes only).
  */
 export function buildLoginAuthUrl(state: string): string {
   const { clientId, clientSecret } = getClientCredentials();
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-  if (!redirectUri) throw new Error('[googleAuth] GOOGLE_REDIRECT_URI is not set.');
+  const redirectUri = getLoginRedirectUri();
 
   const client = new OAuth2Client(clientId, clientSecret, redirectUri);
   return client.generateAuthUrl({
@@ -69,8 +84,7 @@ export function buildLoginAuthUrl(state: string): string {
  */
 export function buildGmailAuthUrl(state: string): string {
   const { clientId, clientSecret } = getClientCredentials();
-  const redirectUri = process.env.GMAIL_REDIRECT_URI;
-  if (!redirectUri) throw new Error('[googleAuth] GMAIL_REDIRECT_URI is not set.');
+  const redirectUri = getGmailRedirectUri();
 
   const client = new OAuth2Client(clientId, clientSecret, redirectUri);
   return client.generateAuthUrl({
@@ -87,7 +101,7 @@ export function buildGmailAuthUrl(state: string): string {
  */
 export async function exchangeLoginCode(code: string): Promise<TokenResponse> {
   const { clientId, clientSecret } = getClientCredentials();
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI!;
+  const redirectUri = getLoginRedirectUri();
   const client = new OAuth2Client(clientId, clientSecret, redirectUri);
 
   const { tokens } = await client.getToken(code);
@@ -109,7 +123,7 @@ export async function exchangeLoginCode(code: string): Promise<TokenResponse> {
  */
 export async function exchangeGmailCode(code: string): Promise<TokenResponse> {
   const { clientId, clientSecret } = getClientCredentials();
-  const redirectUri = process.env.GMAIL_REDIRECT_URI!;
+  const redirectUri = getGmailRedirectUri();
   const client = new OAuth2Client(clientId, clientSecret, redirectUri);
 
   const { tokens } = await client.getToken(code);

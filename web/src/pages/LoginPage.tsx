@@ -2,8 +2,14 @@ import { useAuth } from '../services/authContext';
 import { Icon } from '../components/Icon';
 
 export function LoginPage() {
-  const { login, auth } = useAuth();
+  const { login, auth, errorMessage, serverReachable } = useAuth();
   const isLoading = auth.status === 'loading';
+
+  const displayError =
+    errorMessage ||
+    (!serverReachable
+      ? 'Could not connect to PriorityMail server. Please ensure the backend is running.'
+      : null);
 
   return (
     <div className="login-page">
@@ -16,6 +22,24 @@ export function LoginPage() {
           <h1>PriorityMail</h1>
           <p className="login-tagline">Your important emails, without the noise.</p>
         </div>
+
+        {/* Status / Error banner */}
+        {displayError && (
+          <div
+            className="notice"
+            role="alert"
+            style={{
+              marginBottom: 18,
+              background: '#fef2f2',
+              borderColor: '#fecaca',
+              color: '#991b1b',
+              fontSize: '12px',
+              lineHeight: '1.5',
+            }}
+          >
+            <strong>Connection note:</strong> {displayError}
+          </div>
+        )}
 
         {/* Features summary */}
         <ul className="login-features" aria-label="What PriorityMail does">
@@ -36,6 +60,7 @@ export function LoginPage() {
         {/* CTA */}
         <button
           id="login-google-btn"
+          type="button"
           className="login-google-btn"
           onClick={login}
           disabled={isLoading}

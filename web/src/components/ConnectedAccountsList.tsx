@@ -94,6 +94,7 @@ export function ConnectedAccountsList({
 
       <button
         id="add-gmail-account-btn"
+        type="button"
         className="secondary full"
         disabled={connecting}
         onClick={handleAddAccount}

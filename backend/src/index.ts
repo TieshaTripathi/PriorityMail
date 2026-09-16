@@ -12,9 +12,9 @@ import { gmailRouter } from './routes/gmail.js';
 // ----------------------------------------------------------------
 // Validate required secrets on startup
 // ----------------------------------------------------------------
-const SESSION_SECRET = process.env.SESSION_SECRET;
-if (!SESSION_SECRET) {
-  console.error('[startup] SESSION_SECRET is not set. The server will not start securely.');
+const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-session-secret-change-in-production';
+if (!process.env.SESSION_SECRET && process.env.NODE_ENV === 'production') {
+  console.error('[startup] SESSION_SECRET must be set in production.');
   process.exit(1);
 }
 
@@ -23,34 +23,52 @@ getDb();
 
 const app = express();
 
+// Trust reverse proxy (Render, Fly.io, Cloudflare, etc.) so secure cookies work
+app.set('trust proxy', 1);
+
 // ----------------------------------------------------------------
-// CORS — allow the web app origin to send cookies
+// CORS — allow the web app origin to send credentials
 // ----------------------------------------------------------------
-const allowedOrigins = [
-  process.env.WEB_APP_URL ?? 'http://localhost:5173',
-  'http://localhost:5173',
-  'http://localhost:4173', // Vite preview
-];
+const isProduction = process.env.NODE_ENV === 'production';
+
+const configuredOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.WEB_APP_URL,
+]
+  .filter(Boolean)
+  .flatMap((url) => (url as string).split(',').map((s) => s.trim().replace(/\/+$/, '')));
+
+const allowedOrigins = Array.from(
+  new Set([
+    'https://priority-mail-zeta.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:4173', // Vite preview
+    ...configuredOrigins,
+  ]),
+);
 
 app.use(
   cors({
     origin: (origin, cb) => {
       // Allow requests with no origin (curl, Postman, mobile apps)
-      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      if (!origin) return cb(null, true);
+      const normalized = origin.replace(/\/+$/, '');
+      if (allowedOrigins.includes(normalized)) {
+        return cb(null, true);
+      }
       cb(new Error(`CORS: origin ${origin} not allowed`));
     },
-    credentials: true, // Required for cookies
+    credentials: true, // Required for cross-domain cookies
   }),
 );
 
 app.use(express.json());
 
 // ----------------------------------------------------------------
-// Sessions — in-memory store for development
-// NOTE: Replace with a persistent session store for production.
-// Options: connect-sqlite3 (requires better-sqlite3 build tools),
-//          connect-redis (requires Redis), or a custom node:sqlite store.
-// For local dev, MemoryStore is fine (sessions reset on server restart).
+// Sessions
+// In production across domains (e.g. Vercel frontend + Render backend),
+// cookies must have SameSite=None and Secure=true over HTTPS.
+// In local development on localhost, SameSite=Lax and Secure=false.
 // ----------------------------------------------------------------
 app.use(
   session({
@@ -58,22 +76,30 @@ app.use(
     name: 'pm.sid',
     resave: false,
     saveUninitialized: false,
+    proxy: isProduction,
     cookie: {
       httpOnly: true,
-      sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
+      sameSite: isProduction ? 'none' : 'lax',
+      secure: isProduction,
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
   }),
 );
 
 // ----------------------------------------------------------------
+// Health Check Endpoints (safe, does not expose secrets)
+// ----------------------------------------------------------------
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// ----------------------------------------------------------------
 // Routes
 // ----------------------------------------------------------------
-app.get('/health', (_req, res) =>
-  res.json({ ok: true, service: 'priority-mail-backend', version: '2.0.0' }),
-);
-
 app.use('/api/auth', authRouter);
 app.use('/api/accounts', accountsRouter);
 app.use('/api/gmail', gmailRouter);

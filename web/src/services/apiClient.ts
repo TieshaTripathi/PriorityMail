@@ -2,14 +2,15 @@
 // All requests go to the backend. No secrets live in the frontend bundle.
 // Credentials (session cookies) are sent automatically by the browser.
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
+import { getApiBaseUrl } from './apiUrl';
 
 async function apiFetch<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include', // send session cookie
+  const base = getApiBaseUrl();
+  const res = await fetch(`${base}${path}`, {
+    credentials: 'include', // send session cookie cross-origin
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     ...options,
   });
@@ -56,10 +57,20 @@ export async function getMe(): Promise<UserDto | null> {
   }
 }
 
-/** Get the Google login URL from the backend. */
+/** Get the direct browser navigation URL for Google login. */
+export function getDirectLoginUrl(): string {
+  return `${getApiBaseUrl()}/api/auth/google`;
+}
+
+/** Get the Google login URL from the backend (or fallback to direct OAuth endpoint). */
 export async function getLoginUrl(): Promise<string> {
-  const data = await apiFetch<{ url: string }>('/api/auth/google/login');
-  return data.url;
+  try {
+    const data = await apiFetch<{ url: string }>('/api/auth/google/login');
+    if (data.url) return data.url;
+  } catch {
+    // Fall back to direct navigation if JSON endpoint is unavailable
+  }
+  return getDirectLoginUrl();
 }
 
 /** Destroy the current session. */
@@ -86,12 +97,22 @@ export async function getConnectedAccounts(): Promise<ConnectedAccountDto[]> {
   return apiFetch<ConnectedAccountDto[]>('/api/accounts');
 }
 
+/** Get the direct browser navigation URL to connect a Gmail account. */
+export function getDirectConnectGmailUrl(): string {
+  return `${getApiBaseUrl()}/api/accounts/google/connect`;
+}
+
 /** Get the URL to start connecting a new Gmail account. */
 export async function startConnectGmailAccount(): Promise<string> {
-  const data = await apiFetch<{ url: string }>('/api/accounts/connect/start', {
-    method: 'POST',
-  });
-  return data.url;
+  try {
+    const data = await apiFetch<{ url: string }>('/api/accounts/connect/start', {
+      method: 'POST',
+    });
+    if (data.url) return data.url;
+  } catch {
+    // Fall back to direct navigation if JSON endpoint is unavailable
+  }
+  return getDirectConnectGmailUrl();
 }
 
 /** Disconnect a Gmail account. */

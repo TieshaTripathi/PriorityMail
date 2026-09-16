@@ -11,10 +11,10 @@ const IV_BYTES = 12;   // 96-bit IV recommended for GCM
 const TAG_BYTES = 16;  // 128-bit auth tag
 
 function getKey(): Buffer {
-  const hex = process.env.ENCRYPTION_KEY;
+  const hex = process.env.TOKEN_ENCRYPTION_KEY || process.env.ENCRYPTION_KEY;
   if (!hex || hex.length !== 64) {
     throw new Error(
-      '[encryption] ENCRYPTION_KEY must be a 64-character hex string. ' +
+      '[encryption] TOKEN_ENCRYPTION_KEY (or ENCRYPTION_KEY) must be a 64-character hex string. ' +
       'Generate one with: openssl rand -hex 32',
     );
   }

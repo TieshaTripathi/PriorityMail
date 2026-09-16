@@ -58,6 +58,37 @@ accountsRouter.get('/', requireAuth, (req: Request, res: Response) => {
   );
 });
 
+function getFrontendUrl(): string {
+  const url =
+    process.env.FRONTEND_URL ??
+    process.env.WEB_APP_URL ??
+    'http://localhost:5173';
+  return url.replace(/\/+$/, '');
+}
+
+/**
+ * Direct browser navigation endpoint: GET /api/accounts/google/connect
+ * Redirects browser to Google OAuth consent screen for Gmail permissions.
+ */
+accountsRouter.get('/google/connect', requireAuth, (req: Request, res: Response) => {
+  const state = randomBytes(16).toString('hex');
+  req.session.gmailOAuthState = state;
+  req.session.save((err) => {
+    const frontendUrl = getFrontendUrl();
+    if (err) {
+      console.error('[accounts] Session save error:', err);
+      return res.redirect(`${frontendUrl}/#settings?connect_error=server_error`);
+    }
+    try {
+      const url = buildGmailAuthUrl(state);
+      res.redirect(url);
+    } catch (e) {
+      console.error('[accounts] buildGmailAuthUrl error:', e);
+      res.redirect(`${frontendUrl}/#settings?connect_error=server_error`);
+    }
+  });
+});
+
 accountsRouter.post('/connect/start', requireAuth, (req: Request, res: Response) => {
   const state = randomBytes(16).toString('hex');
   req.session.gmailOAuthState = state;
@@ -75,20 +106,20 @@ accountsRouter.post('/connect/start', requireAuth, (req: Request, res: Response)
   });
 });
 
-accountsRouter.get('/connect/callback', async (req: Request, res: Response) => {
+async function handleGmailCallback(req: Request, res: Response) {
   const { code, state: returnedState, error: oauthError } = req.query;
-  const webAppUrl = process.env.WEB_APP_URL ?? 'http://localhost:5173';
+  const frontendUrl = getFrontendUrl();
 
   if (oauthError || !code || typeof code !== 'string') {
-    return res.redirect(`${webAppUrl}/#settings?connect_error=access_denied`);
+    return res.redirect(`${frontendUrl}/#settings?connect_error=access_denied`);
   }
 
   if (!req.session.gmailOAuthState || req.session.gmailOAuthState !== returnedState) {
-    return res.redirect(`${webAppUrl}/#settings?connect_error=state_mismatch`);
+    return res.redirect(`${frontendUrl}/#settings?connect_error=state_mismatch`);
   }
 
   if (!req.session.userId) {
-    return res.redirect(`${webAppUrl}/?auth_error=session_expired`);
+    return res.redirect(`${frontendUrl}/?auth_error=session_expired`);
   }
 
   delete req.session.gmailOAuthState;
@@ -167,12 +198,15 @@ accountsRouter.get('/connect/callback', async (req: Request, res: Response) => {
     }
 
     console.log(`[accounts] Connected Gmail account: ${gmailEmail} for user ${userId}`);
-    res.redirect(`${webAppUrl}/#settings?connect_success=1`);
+    res.redirect(`${frontendUrl}/#settings?connect_success=1`);
   } catch (err) {
-    console.error('[accounts] connect/callback error:', err);
-    res.redirect(`${process.env.WEB_APP_URL ?? 'http://localhost:5173'}/#settings?connect_error=server_error`);
+    console.error('[accounts] connect callback error:', err);
+    res.redirect(`${frontendUrl}/#settings?connect_error=server_error`);
   }
-});
+}
+
+accountsRouter.get('/google/callback', handleGmailCallback);
+accountsRouter.get('/connect/callback', handleGmailCallback);
 
 accountsRouter.delete('/:accountId', requireAuth, async (req: Request, res: Response) => {
   const userId = req.session.userId as string;

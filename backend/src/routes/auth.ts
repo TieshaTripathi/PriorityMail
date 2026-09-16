@@ -11,6 +11,30 @@ import { getDb } from '../db/database.js';
 
 export const authRouter = Router();
 
+function getFrontendUrl(): string {
+  const url =
+    process.env.FRONTEND_URL ??
+    process.env.WEB_APP_URL ??
+    'http://localhost:5173';
+  return url.replace(/\/+$/, '');
+}
+
+/**
+ * Direct browser navigation endpoint: GET /api/auth/google
+ * Instantly redirects browser to Google OAuth consent screen.
+ */
+authRouter.get('/google', (_req: Request, res: Response) => {
+  const state = randomBytes(16).toString('hex');
+  try {
+    const url = buildLoginAuthUrl(state);
+    res.redirect(url);
+  } catch (err) {
+    console.error('[auth] buildLoginAuthUrl error:', err);
+    const frontendUrl = getFrontendUrl();
+    res.redirect(`${frontendUrl}/?auth_error=oauth_not_configured`);
+  }
+});
+
 authRouter.get('/google/login', (_req: Request, res: Response) => {
   const state = randomBytes(16).toString('hex');
   try {
@@ -18,17 +42,17 @@ authRouter.get('/google/login', (_req: Request, res: Response) => {
     res.json({ url, state });
   } catch (err) {
     console.error('[auth] buildLoginAuthUrl error:', err);
-    res.status(500).json({ error: 'OAuth not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.' });
+    res.status(500).json({ error: 'OAuth not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_AUTH_REDIRECT_URI.' });
   }
 });
 
 authRouter.get('/google/callback', async (req: Request, res: Response) => {
   const { code, error: oauthError } = req.query;
-  const webAppUrl = process.env.WEB_APP_URL ?? 'http://localhost:5173';
+  const frontendUrl = getFrontendUrl();
 
   if (oauthError || !code || typeof code !== 'string') {
     console.error('[auth] OAuth error from Google:', oauthError);
-    return res.redirect(`${webAppUrl}/?auth_error=access_denied`);
+    return res.redirect(`${frontendUrl}/?auth_error=access_denied`);
   }
 
   try {
@@ -62,10 +86,10 @@ authRouter.get('/google/callback', async (req: Request, res: Response) => {
     });
 
     console.log(`[auth] Login successful: ${profile.email}`);
-    res.redirect(`${webAppUrl}/?auth=success`);
+    res.redirect(`${frontendUrl}/?auth=success`);
   } catch (err) {
     console.error('[auth] Callback error:', err);
-    res.redirect(`${process.env.WEB_APP_URL ?? 'http://localhost:5173'}/?auth_error=server_error`);
+    res.redirect(`${frontendUrl}/?auth_error=server_error`);
   }
 });
 
