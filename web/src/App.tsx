@@ -8,6 +8,15 @@ import { useStored } from './services/storage';
 import { gmailWebUrl, openEmailInGmail } from './services/gmailDeepLink';
 import { mockNotification, requestNotificationPermission, type NotificationPreferences } from './services/notifications';
 import type { PriorityRule, PriorityRuleType, VipPerson, PrioritySensitivity } from './types';
+import { AuthProvider, useAuth } from './services/authContext';
+import { LoginPage } from './pages/LoginPage';
+import { ConnectedAccountsList } from './components/ConnectedAccountsList';
+import {
+  getConnectedAccounts,
+  fetchGmailMessages,
+  type ConnectedAccountDto,
+  type GmailEmailDto,
+} from './services/apiClient';
 
 const tabs = [ ['inbox', 'Priority Inbox', 'inbox'], ['all', 'All Emails', 'mail'], ['rules', 'Rules', 'rules'], ['people', 'VIP People', 'star'], ['settings', 'Settings', 'settings'] ] as const;
 type Tab = typeof tabs[number][0];
@@ -42,7 +51,45 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   return <div className="empty"><span className="empty-icon"><Icon name="check" /></span><h3>{title}</h3><p>{body}</p></div>;
 }
 
-export function App() {
+// ----------------------------------------------------------------
+// Converts a GmailEmailDto to a PriorityEmail-compatible shape for
+// the existing email list UI.
+// ----------------------------------------------------------------
+function gmailDtoToEmail(dto: GmailEmailDto) {
+  return {
+    ...dto,
+    // Compute a human-readable receivedAt for display
+    receivedAt: formatReceivedAt(dto.receivedAt),
+    snoozedUntil: dto.snoozedUntil ?? null,
+    deadline: undefined,
+    body: dto.body,
+    labelIds: dto.labelIds,
+  };
+}
+
+function formatReceivedAt(iso: string): string {
+  try {
+    const date = new Date(iso);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 60) return `${diffMin} min ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr} hr ago`;
+    if (diffHr < 48) return 'Yesterday';
+    return date.toLocaleDateString();
+  } catch {
+    return iso;
+  }
+}
+
+// ----------------------------------------------------------------
+// Inner app (rendered only when authenticated)
+// ----------------------------------------------------------------
+function AppInner() {
+  const { auth, logout } = useAuth();
+  const user = auth.status === 'authenticated' ? auth.user : null;
+
   const [location, setLocation] = useState(route);
   const [rules, setRules, rulesError] = useStored('rules', defaultMockRules, validRules);
   const [people, setPeople, peopleError] = useStored('people', defaultVipPeople, validPeople);
@@ -62,7 +109,36 @@ export function App() {
   const [updateReady, setUpdateReady] = useState(false);
   const [offlineError, setOfflineError] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<(Event & { prompt: () => Promise<void> }) | null>(null);
+
+  // Real Gmail accounts from backend
+  const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccountDto[]>([]);
+  const [gmailEmails, setGmailEmails] = useState<GmailEmailDto[]>([]);
+  const [gmailAccountId, setGmailAccountId] = useState<string | null>(null);
+  const [gmailLoading, setGmailLoading] = useState(false);
+  const [gmailError, setGmailError] = useState('');
+
   const tab = location.tab;
+
+  // Load connected accounts on mount
+  useEffect(() => {
+    getConnectedAccounts()
+      .then(setConnectedAccounts)
+      .catch(() => { /* not critical */ });
+  }, []);
+
+  // Handle ?connect_success=1 from Gmail OAuth callback
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('connect_success') === '1') {
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      setToast('Gmail account connected! Go to All Emails to fetch real messages.');
+      getConnectedAccounts().then(setConnectedAccounts).catch(() => {});
+    }
+    if (params.get('connect_error')) {
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      setToast('Gmail connection failed. Please try again.');
+    }
+  }, []);
 
   useEffect(() => {
     const change = () => { setLocation(route()); window.scrollTo(0, 0); };
@@ -86,27 +162,41 @@ export function App() {
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(''), 6000); return () => window.clearTimeout(timer); }, [toast]);
   useEffect(() => { document.title = `${location.detail ? 'Email' : tabs.find(t => t[0] === tab)?.[1]} · PriorityMail`; }, [tab, location.detail]);
 
-  const emails = useMemo(() => initialMockEmails.map(email => ({
+  const mockEmails = useMemo(() => initialMockEmails.map(email => ({
     ...email,
     ...calculatePriority(email, rules, people, settings.sensitivity),
     isCompleted: done.includes(email.id),
     isRead: read.includes(email.id) || email.isRead,
     snoozedUntil: snoozes[email.id] && Date.parse(snoozes[email.id]) > now ? snoozes[email.id] : null,
   })).sort((a, b) => (b.score || 0) - (a.score || 0)), [rules, people, settings.sensitivity, done, read, snoozes, now]);
-  const active = emails.filter(e => !e.isCompleted && !e.snoozedUntil && (e.priority === 'urgent' || e.priority === 'high'));
-  const visible = (tab === 'inbox' ? active : emails).filter(e =>
-    (filter === 'all' || e.category === filter) && (account === 'all' || e.accountId === account) &&
+
+  // In "All Emails" with a real Gmail account selected, show Gmail emails
+  const realEmailsActive = tab === 'all' && gmailAccountId !== null && gmailEmails.length > 0;
+
+  const baseEmails = realEmailsActive
+    ? gmailEmails.map(gmailDtoToEmail).map(e => ({
+        ...e,
+        isCompleted: done.includes(e.id),
+        isRead: read.includes(e.id) || e.isRead,
+        snoozedUntil: snoozes[e.id] && Date.parse(snoozes[e.id]) > now ? snoozes[e.id] : null,
+      }))
+    : mockEmails;
+
+  const active = mockEmails.filter(e => !e.isCompleted && !e.snoozedUntil && (e.priority === 'urgent' || e.priority === 'high'));
+  const visible = (tab === 'inbox' ? active : baseEmails).filter(e =>
+    (filter === 'all' || e.category === filter) &&
+    (account === 'all' || e.accountId === account) &&
     (status === 'all' || (status === 'done' ? e.isCompleted : status === 'snoozed' ? !!e.snoozedUntil : !e.isCompleted && !e.snoozedUntil)) &&
     `${e.subject} ${e.senderName} ${e.senderEmail} ${e.snippet}`.toLowerCase().includes(search.toLowerCase())
   );
-  const selected = emails.find(e => e.id === location.detail);
+  const selected = baseEmails.find(e => e.id === location.detail);
   const complete = (id: string) => { setDone(ids => ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id]); setToast(done.includes(id) ? 'Moved back to your inbox.' : 'Marked done. One less thing on your mind.'); };
   const open = (id: string) => { setRead(ids => ids.includes(id) ? ids : [...ids, id]); window.location.hash = `email/${encodeURIComponent(id)}`; };
   const navigate = (next: Tab) => { setSearch(''); setFilter('all'); setStatus('all'); setAccount('all'); window.location.hash = next; };
   const closeDetail = () => { window.location.hash = 'all'; };
   const snooze = (date: Date) => {
     if (!Number.isFinite(date.getTime()) || date.getTime() <= Date.now()) { setToast('Choose a future time.'); return; }
-    setSnoozes(s => ({ ...s, [snoozeId]: date.toISOString() })); setSnoozeId(''); setToast('Snoozed. You’ll find it in All Emails until then.');
+    setSnoozes(s => ({ ...s, [snoozeId]: date.toISOString() })); setSnoozeId(''); setToast("Snoozed. You'll find it in All Emails until then.");
   };
   const addRule = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -123,26 +213,75 @@ export function App() {
   const setting = <K extends keyof Settings>(key: K, value: Settings[K]) => setSettings(s => ({ ...s, [key]: value }));
   const storageError = rulesError || peopleError || settingsError || doneError || readError || snoozeError;
   const greeting = new Date(now).getHours() < 12 ? 'Good morning' : new Date(now).getHours() < 17 ? 'Good afternoon' : 'Good evening';
+  const userName = user?.displayName?.split(' ')[0] ?? 'there';
+
+  const fetchRealEmails = async (accountId: string) => {
+    setGmailLoading(true);
+    setGmailError('');
+    try {
+      const result = await fetchGmailMessages(accountId, 20);
+      setGmailEmails(result.emails);
+      setGmailAccountId(accountId);
+      setToast(`Fetched ${result.emails.length} real emails from ${result.accountEmail}.`);
+    } catch {
+      setGmailError('Could not fetch Gmail messages. Check your connection and try again.');
+      setGmailEmails([]);
+    } finally {
+      setGmailLoading(false);
+    }
+  };
+
+  const allAccountOptions = [
+    ...mockConnectedAccounts,
+    ...connectedAccounts.map(a => ({ id: a.id, email: a.email, displayName: a.displayName, isPrimary: a.isPrimary, status: 'connected' as const })),
+  ];
 
   return <div className="app-shell">
-    <header className="topbar"><a className="brand" href="#inbox"><span className="brand-mark"><Icon name="mail" /></span>PriorityMail</a><button className="profile" aria-label="Open Settings" onClick={() => navigate('settings')}>T</button></header>
+    <header className="topbar">
+      <a className="brand" href="#inbox"><span className="brand-mark"><Icon name="mail" /></span>PriorityMail</a>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        {user?.avatarUrl
+          ? <img src={user.avatarUrl} alt={user.displayName} width={32} height={32} style={{ borderRadius: '50%', cursor: 'pointer' }} referrerPolicy="no-referrer" onClick={() => navigate('settings')} />
+          : <button className="profile" aria-label="Open Settings" onClick={() => navigate('settings')}>{(user?.displayName?.[0] ?? 'U').toUpperCase()}</button>
+        }
+      </div>
+    </header>
     <main>
-      {!online && <div className="notice">You’re offline. Your saved inbox and rules are available.</div>}
+      {!online && <div className="notice">You're offline. Your saved inbox and rules are available.</div>}
       {storageError && <div className="notice" role="alert">Storage is unavailable. Changes will last for this session only.</div>}
       {offlineError && <div className="notice" role="alert">Offline setup failed. Reconnect and reload to try again.</div>}
       {updateReady && <div className="notice">An update is ready. Close all PriorityMail windows and reopen to update.</div>}
       {(tab === 'inbox' || tab === 'all') && <>
-        <section className="page-heading"><div className="eyebrow">{tab === 'inbox' ? 'A LITTLE FOCUS. A LOT LESS NOISE.' : 'EVERY ACCOUNT, ONE PLACE'}</div><h1>{tab === 'inbox' ? <>{greeting},<br />Tiesha <span className="hello">✦</span></> : 'All Emails'}</h1><p>{tab === 'inbox' ? 'Your important emails, without the noise.' : 'Find what you need. Leave the rest for later.'}</p></section>
+        <section className="page-heading"><div className="eyebrow">{tab === 'inbox' ? 'A LITTLE FOCUS. A LOT LESS NOISE.' : 'EVERY ACCOUNT, ONE PLACE'}</div><h1>{tab === 'inbox' ? <>{greeting},<br />{userName} <span className="hello">✦</span></> : 'All Emails'}</h1><p>{tab === 'inbox' ? 'Your important emails, without the noise.' : 'Find what you need. Leave the rest for later.'}</p></section>
         {tab === 'inbox' && <><section className="stats" aria-label="Inbox summary">{[
           ['Needs attention', active.length, 'inbox'], ['Urgent', active.filter(e => e.priority === 'urgent').length, 'bell'], ['Deadlines', active.filter(e => e.deadline).length, 'clock'],
-        ].map(([label, count, icon], i) => <div className={`stat stat-${i}`} key={label}><Icon name={icon as IconName} /><strong>{count}</strong><span>{label}</span></div>)}</section><div className="focus-note"><span className="focus-dot" /><p>A calmer inbox starts here.<br /><strong>We’ve brought the important things forward.</strong></p></div></>}
+        ].map(([label, count, icon], i) => <div className={`stat stat-${i}`} key={String(label)}><Icon name={icon as IconName} /><strong>{count}</strong><span>{label}</span></div>)}</section><div className="focus-note"><span className="focus-dot" /><p>A calmer inbox starts here.<br /><strong>We've brought the important things forward.</strong></p></div></>}
         <div className="section-title"><h2>{tab === 'inbox' ? 'Your priority list' : 'Your messages'}</h2><span>{visible.length} emails</span></div>
         {tab === 'all' && <label className="search"><Icon name="search" /><input type="search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search sender or subject" aria-label="Search emails" /></label>}
         <div className="filter-row" aria-label="Filter category">{['all', 'work', 'college', 'internship', 'academic', 'personal'].map(c => <button key={c} className={`chip ${filter === c ? 'selected' : ''}`} aria-pressed={filter === c} onClick={() => setFilter(c)}>{c === 'all' ? 'All' : c}</button>)}</div>
-        {tab === 'all' && <div className="select-row"><label>Account<select value={account} onChange={e => setAccount(e.target.value)}><option value="all">All accounts</option>{mockConnectedAccounts.map(a => <option key={a.id} value={a.id}>{a.displayName}</option>)}</select></label><label>Status<select value={status} onChange={e => setStatus(e.target.value)}><option value="all">All messages</option><option value="active">Active</option><option value="done">Completed</option><option value="snoozed">Snoozed</option></select></label></div>}
-        <div className="email-list">{visible.map(email => <EmailCard key={email.id} email={email} onOpen={() => open(email.id)} onDone={() => complete(email.id)} onSnooze={() => setSnoozeId(email.id)} />)}</div>
+        {tab === 'all' && <div className="select-row">
+          <label>Account<select value={account} onChange={e => setAccount(e.target.value)}>
+            <option value="all">All accounts</option>
+            {allAccountOptions.map(a => <option key={a.id} value={a.id}>{a.displayName}{a.status === 'connected' ? ' ✓' : ' (demo)'}</option>)}
+          </select></label>
+          <label>Status<select value={status} onChange={e => setStatus(e.target.value)}><option value="all">All messages</option><option value="active">Active</option><option value="done">Completed</option><option value="snoozed">Snoozed</option></select></label>
+          {connectedAccounts.length > 0 && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8, width: '100%' }}>
+              <span className="tiny muted" style={{ width: '100%' }}>Fetch real emails from a connected account:</span>
+              {connectedAccounts.map(a => (
+                <button key={a.id} className="secondary" disabled={gmailLoading} onClick={() => fetchRealEmails(a.id)} aria-busy={gmailLoading && gmailAccountId === a.id} style={{ fontSize: 12 }}>
+                  {gmailLoading && gmailAccountId === a.id ? 'Fetching…' : `Load: ${a.email}`}
+                </button>
+              ))}
+              {gmailAccountId && <button className="text-button" onClick={() => { setGmailEmails([]); setGmailAccountId(null); }}>Show mock emails</button>}
+            </div>
+          )}
+          {gmailError && <p className="help" style={{ color: 'var(--danger, #ef4444)', width: '100%' }}>{gmailError}</p>}
+        </div>}
+        <div className="email-list">{visible.map(email => <EmailCard key={email.id} email={email as import('./types').PriorityEmail} onOpen={() => open(email.id)} onDone={() => complete(email.id)} onSnooze={() => setSnoozeId(email.id)} />)}</div>
         {!visible.length && <EmptyState title="A little breathing room" body="No emails match this view. Try another filter or check All Emails." />}
-        <p className="demo-caption">LOCAL DEMO · THREE ACCOUNTS · ZERO INBOX ACCESS</p>
+        {!realEmailsActive && <p className="demo-caption">LOCAL DEMO · THREE ACCOUNTS · ZERO INBOX ACCESS</p>}
+        {realEmailsActive && <p className="demo-caption">LIVE GMAIL · PRIORITY ENGINE · READ-ONLY ACCESS</p>}
       </>}
       {tab === 'rules' && <>
         <section className="page-heading"><div className="eyebrow">YOUR INBOX, YOUR CALL</div><h1>Priority rules</h1><p>Teach your inbox what matters to you.</p></section>
@@ -161,11 +300,23 @@ export function App() {
       </>}
       {tab === 'settings' && <>
         <section className="page-heading"><div className="eyebrow">MAKE ROOM FOR WHAT MATTERS</div><h1>Settings</h1><p>A quieter inbox, on your terms.</p></section>
-        <h2 className="settings-title">Connected Gmail accounts</h2><section className="settings-card">{mockConnectedAccounts.map(a => <div className="connected" key={a.id}><span className="avatar">{a.displayName[0]}</span><div className="grow"><strong>{a.displayName}</strong><small>{a.email}</small><span className="demo-tag">Demo connection{a.isPrimary ? ' · Primary' : ''}</span></div><button className="text-button danger" aria-label={`Remove ${a.email}`} onClick={() => setToast('Demo account. Real account removal will be available with OAuth.')}>Remove</button></div>)}<button className="secondary full" onClick={() => setToast('Google OAuth is coming next. No real account is connected yet.')}><Icon name="plus" />Add Gmail account</button></section>
+
+        {/* Account info */}
+        {user && <><h2 className="settings-title">Your account</h2><section className="settings-card"><div className="connected"><span className="avatar">{user.displayName[0]}</span><div className="grow"><strong>{user.displayName}</strong><small>{user.email}</small></div><button className="text-button danger" onClick={async () => { await logout(); setToast('Signed out successfully.'); }}>Sign out</button></div></section></>}
+
+        {/* Real connected Gmail accounts */}
+        <h2 className="settings-title">Connected Gmail accounts</h2>
+        <ConnectedAccountsList
+          accounts={connectedAccounts}
+          onAccountAdded={() => getConnectedAccounts().then(setConnectedAccounts)}
+          onAccountRemoved={(id) => setConnectedAccounts(prev => prev.filter(a => a.id !== id))}
+          onToast={setToast}
+        />
+
         <h2 className="settings-title">Notifications</h2><section className="settings-card"><Toggle label="Notifications" description="Allow local demo alerts" checked={settings.notifications} onChange={v => setting('notifications', v)} /><Toggle label="Deadline alerts" description="A heads-up before time runs out" checked={settings.deadlineAlerts} onChange={v => setting('deadlineAlerts', v)} /><Toggle label="VIP alerts" description="Keep your people close" checked={settings.vipAlerts} onChange={v => setting('vipAlerts', v)} /><button className="secondary full" onClick={() => setToast(mockNotification(settings, 'deadline'))}>Try a demo deadline alert</button><button className="text-button blue full" onClick={async () => setToast(await requestNotificationPermission())}>Enable future system notifications</button><p className="help">Alerts are mocked in-app. No background reminders or push subscriptions are active.</p></section>
-        <h2 className="settings-title">Quiet hours</h2><section className="settings-card"><Toggle label="Give yourself a break" description="Silence demo alerts during these hours" checked={settings.quietHours} onChange={v => setting('quietHours', v)} /><div className="select-row"><label>From<input type="time" required value={settings.quietStart} onChange={e => { if (e.target.value) setting('quietStart', e.target.value); }} /></label><label>Until<input type="time" required value={settings.quietEnd} onChange={e => { if (e.target.value) setting('quietEnd', e.target.value); }} /></label></div><p className="help">Uses your phone’s local time. Equal times silence alerts all day.</p></section>
+        <h2 className="settings-title">Quiet hours</h2><section className="settings-card"><Toggle label="Give yourself a break" description="Silence demo alerts during these hours" checked={settings.quietHours} onChange={v => setting('quietHours', v)} /><div className="select-row"><label>From<input type="time" required value={settings.quietStart} onChange={e => { if (e.target.value) setting('quietStart', e.target.value); }} /></label><label>Until<input type="time" required value={settings.quietEnd} onChange={e => { if (e.target.value) setting('quietEnd', e.target.value); }} /></label></div><p className="help">Uses your phone's local time. Equal times silence alerts all day.</p></section>
         <h2 className="settings-title">Priority assistant</h2><section className="settings-card"><Toggle label="AI classification" description="Saved preference for future AI; local rules run now" checked={settings.aiClassification} onChange={v => setting('aiClassification', v)} /><label className="field">Priority sensitivity<select value={settings.sensitivity} onChange={e => setting('sensitivity', e.target.value as PrioritySensitivity)}>{['Low', 'Balanced', 'High'].map(v => <option key={v}>{v}</option>)}</select></label></section>
-        <h2 className="settings-title">Your app, your data</h2><section className="settings-card"><p className="help">Your demo inbox is stored locally. No Gmail passwords or account tokens are requested. Clearing browser data resets your preferences.</p><button className="secondary full" onClick={() => setModal('install')}>Install PriorityMail</button><button className="text-button danger full" onClick={() => setModal('reset')}>Reset local demo data</button></section><p className="demo-caption">PRIORITYMAIL 1.0 · BUILT FOR A CALMER DAY</p>
+        <h2 className="settings-title">Your app, your data</h2><section className="settings-card"><p className="help">Your demo inbox is stored locally. Connected Gmail accounts use OAuth read-only access. Clearing browser data resets your preferences.</p><button className="secondary full" onClick={() => setModal('install')}>Install PriorityMail</button><button className="text-button danger full" onClick={() => setModal('reset')}>Reset local demo data</button></section><p className="demo-caption">PRIORITYMAIL 2.0 · BUILT FOR A CALMER DAY</p>
       </>}
     </main>
     <nav className="bottom-nav" aria-label="Main navigation">{tabs.map(([id, label, icon]) => <a key={id} href={`#${id}`} aria-current={tab === id ? 'page' : undefined} onClick={e => { e.preventDefault(); navigate(id); }}><span><Icon name={icon} /></span>{label}</a>)}</nav>
@@ -173,16 +324,45 @@ export function App() {
     {location.detail && !snoozeId && <Modal title="Email details" onClose={closeDetail}>{selected ? <>
       <PriorityBadge priority={selected.priority} /><div className="detail-sender"><span className="avatar">{selected.senderName[0]}</span><div><strong>{selected.senderName}</strong><small>{selected.senderEmail}</small></div></div>
       <div className="opening-account">Opening with <strong>{selected.accountEmail}</strong></div><h1 className="detail-subject">{selected.subject}</h1><span className="category-tag">{selected.category}</span>{selected.deadline && <div className="deadline"><Icon name="clock" />{selected.deadline}</div>}
-      <section className="detail-reasons"><h3>Why PriorityMail flagged this</h3><ul>{selected.reasons.map(r => <li key={r}>{r}</li>)}</ul></section><p className="email-body">{selected.body || selected.snippet}</p><p className="help">Demo message. Its example ID does not correspond to a real Gmail thread.</p>
+      <section className="detail-reasons"><h3>Why PriorityMail flagged this</h3><ul>{selected.reasons.map(r => <li key={r}>{r}</li>)}</ul></section><p className="email-body">{selected.body || selected.snippet}</p>
       <button className="primary full" onClick={() => { try { openEmailInGmail({ accountEmail: selected.accountEmail, threadId: selected.gmailThreadId, messageId: selected.gmailMessageId }); } catch { setToast('Gmail could not open. Try the Gmail web link below.'); } }}>Open in Gmail <Icon name="arrow" /></button>
       <a className="text-button blue full" href={gmailWebUrl({ accountEmail: selected.accountEmail, threadId: selected.gmailThreadId, messageId: selected.gmailMessageId })} target="_blank" rel="noopener noreferrer">Use Gmail web instead</a>
       <div className="select-row"><button className="secondary" onClick={() => complete(selected.id)}><Icon name="check" />{selected.isCompleted ? 'Undo done' : 'Mark done'}</button><button className="secondary" onClick={() => setSnoozeId(selected.id)}><Icon name="clock" />Snooze</button></div>
       {selected.snoozedUntil && <button className="text-button full" onClick={() => setSnoozes(s => { const next = { ...s }; delete next[selected.id]; return next; })}>Unsnooze now</button>}
-    </> : <EmptyState title="Email not found" body="This message is not in the demo inbox." />}</Modal>}
+    </> : <EmptyState title="Email not found" body="This message is not in the current inbox." />}</Modal>}
     {snoozeId && <Modal title="A better time for this" onClose={() => setSnoozeId('')}><p className="help">This email will return to your priority list after the selected time. No background notification is scheduled.</p>{['In 1 hour', 'Tonight · 8 PM', 'Tomorrow · 9 AM'].map((text, i) => <button key={text} className="snooze-option" onClick={() => { const d = new Date(); if (i === 0) d.setHours(d.getHours() + 1); else { if (i === 2) d.setDate(d.getDate() + 1); d.setHours(i === 1 ? 20 : 9, 0, 0, 0); if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1); } snooze(d); }}><Icon name="clock" />{text}<Icon name="arrow" /></button>)}<form onSubmit={e => { e.preventDefault(); snooze(new Date(String(new FormData(e.currentTarget).get('date')))); }}><label className="field">Choose a date and time<input name="date" type="datetime-local" required /></label><button className="primary full">Snooze until then</button></form></Modal>}
     {modal === 'rule' && <Modal title="Add a priority rule" onClose={() => setModal(null)}><form onSubmit={addRule}><label className="field">Rule type<select name="type">{ruleTypes.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}</select></label><label className="field">Match value<input name="value" required maxLength={120} placeholder="e.g. deadline or manager@company.com" /></label><p className="help">Matching messages receive +4 priority points.</p><button className="primary full">Save rule</button></form></Modal>}
     {modal === 'person' && <Modal title="Add a VIP person" onClose={() => setModal(null)}><form onSubmit={addPerson}><label className="field">Name<input name="name" required maxLength={80} autoComplete="name" placeholder="Professor, mentor, manager…" /></label><label className="field">Email<input name="email" type="email" required maxLength={254} autoComplete="email" placeholder="name@example.com" /></label><label className="field">Category<select name="category">{['Mentor', 'Professor', 'Internship Manager', 'Placement Coordinator', 'Personal'].map(c => <option key={c}>{c}</option>)}</select></label><button className="primary full">Add to VIP People</button></form></Modal>}
-    {modal === 'install' && <Modal title="Your inbox, one tap away" onClose={() => setModal(null)}><span className="install-mark"><Icon name="mail" /></span><p>Give PriorityMail a place on your Home Screen.</p><ol className="install-steps"><li>Open your deployed HTTPS link in Safari.</li><li>Tap Share, then Add to Home Screen.</li><li>Keep Open as Web App enabled if shown, then tap Add.</li><li>Launch PriorityMail from its new icon.</li></ol><p className="help">On Android, use Chrome’s Install app or Add to Home screen menu. Offline support activates after the production app loads successfully over HTTPS.</p>{installPrompt && <button className="primary full" onClick={async () => { await installPrompt.prompt(); setInstallPrompt(null); }}>Install app</button>}</Modal>}
+    {modal === 'install' && <Modal title="Your inbox, one tap away" onClose={() => setModal(null)}><span className="install-mark"><Icon name="mail" /></span><p>Give PriorityMail a place on your Home Screen.</p><ol className="install-steps"><li>Open your deployed HTTPS link in Safari.</li><li>Tap Share, then Add to Home Screen.</li><li>Keep Open as Web App enabled if shown, then tap Add.</li><li>Launch PriorityMail from its new icon.</li></ol><p className="help">On Android, use Chrome's Install app or Add to Home screen menu. Offline support activates after the production app loads successfully over HTTPS.</p>{installPrompt && <button className="primary full" onClick={async () => { await installPrompt.prompt(); setInstallPrompt(null); }}>Install app</button>}</Modal>}
     {modal === 'reset' && <Modal title="Reset local demo data?" onClose={() => setModal(null)}><p>This restores default rules, VIPs, settings, and all email states for this web app.</p><button className="primary full" onClick={() => { setRules(defaultMockRules); setPeople(defaultVipPeople); setSettings(defaults); setDone([]); setRead([]); setSnoozes({}); setModal(null); setToast('Your demo has been reset.'); }}>Reset demo</button><button className="text-button full" onClick={() => setModal(null)}>Keep my data</button></Modal>}
   </div>;
+}
+
+// ----------------------------------------------------------------
+// Root App — wraps everything in AuthProvider, gates on auth state
+// ----------------------------------------------------------------
+export function App() {
+  return (
+    <AuthProvider>
+      <AuthGate />
+    </AuthProvider>
+  );
+}
+
+function AuthGate() {
+  const { auth } = useAuth();
+
+  if (auth.status === 'loading') {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100dvh' }}>
+        <span className="login-spinner" aria-label="Loading PriorityMail…" style={{ width: 32, height: 32 }} />
+      </div>
+    );
+  }
+
+  if (auth.status === 'unauthenticated') {
+    return <LoginPage />;
+  }
+
+  return <AppInner />;
 }

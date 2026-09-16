@@ -5,7 +5,6 @@ yarn.lock.bak
 
 # Expo
 .expo/
-dist/
 web-build/
 
 # Native builds
@@ -13,10 +12,21 @@ web-build/
 android/
 ios/
 
-# Environment Variables
+# Environment Variables — NEVER commit these
 .env
 .env.local
 .env.*.local
+*.env
+
+# SQLite database (contains user data and encrypted tokens)
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build outputs
+dist/
+packages/*/dist/
 
 # OS Files
 .DS_Store

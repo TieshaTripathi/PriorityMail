@@ -75,3 +75,32 @@ export interface AppSettings {
   googleAccountConnected: boolean;
   connectedEmail?: string;
 }
+
+// ── Auth / User ─────────────────────────────────────────────────
+
+/** Signed-in PriorityMail user returned by GET /api/auth/me */
+export interface User {
+  id: string;
+  googleUserId: string;
+  email: string;
+  displayName: string;
+  avatarUrl?: string;
+  createdAt: string;
+}
+
+/** Extended ConnectedAccount with server-side fields */
+export interface ConnectedGoogleAccount {
+  id: string;
+  userId: string;
+  googleUserId: string;
+  email: string;
+  displayName: string;
+  avatarUrl?: string;
+  isPrimary: boolean;
+  createdAt: string;
+}
+
+export type AuthState =
+  | { status: 'loading' }
+  | { status: 'authenticated'; user: User }
+  | { status: 'unauthenticated' };

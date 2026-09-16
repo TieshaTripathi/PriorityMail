@@ -1,0 +1,211 @@
+import '../types/session.js';
+import { Router, type Request, type Response } from 'express';
+import { randomBytes } from 'node:crypto';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  buildGmailAuthUrl,
+  exchangeGmailCode,
+  verifyIdToken,
+  buildOAuth2Client,
+} from '../services/googleAuth.js';
+import { getProfile } from '../services/gmailService.js';
+import { encrypt, decrypt } from '../services/encryption.js';
+import { getDb } from '../db/database.js';
+
+export const accountsRouter = Router();
+
+function requireAuth(req: Request, res: Response, next: () => void) {
+  if (!req.session.userId) {
+    res.status(401).json({ error: 'Not authenticated.' });
+    return;
+  }
+  next();
+}
+
+accountsRouter.get('/', requireAuth, (req: Request, res: Response) => {
+  const userId = req.session.userId as string;
+  const db = getDb();
+
+  const accounts = db
+    .prepare(
+      `SELECT id, user_id, google_user_id, email, display_name, avatar_url, is_primary, created_at
+       FROM connected_google_accounts
+       WHERE user_id = ?
+       ORDER BY is_primary DESC, created_at ASC`,
+    )
+    .all(userId) as {
+      id: string;
+      user_id: string;
+      google_user_id: string;
+      email: string;
+      display_name: string;
+      avatar_url: string | null;
+      is_primary: number;
+      created_at: string;
+    }[];
+
+  res.json(
+    accounts.map((a) => ({
+      id: a.id,
+      userId: a.user_id,
+      googleUserId: a.google_user_id,
+      email: a.email,
+      displayName: a.display_name,
+      avatarUrl: a.avatar_url ?? undefined,
+      isPrimary: Boolean(a.is_primary),
+      createdAt: a.created_at,
+    })),
+  );
+});
+
+accountsRouter.post('/connect/start', requireAuth, (req: Request, res: Response) => {
+  const state = randomBytes(16).toString('hex');
+  req.session.gmailOAuthState = state;
+  req.session.save((err) => {
+    if (err) {
+      console.error('[accounts] Session save error:', err);
+      return res.status(500).json({ error: 'Could not save session state.' });
+    }
+    try {
+      const url = buildGmailAuthUrl(state);
+      res.json({ url });
+    } catch (e) {
+      res.status(500).json({ error: String(e) });
+    }
+  });
+});
+
+accountsRouter.get('/connect/callback', async (req: Request, res: Response) => {
+  const { code, state: returnedState, error: oauthError } = req.query;
+  const webAppUrl = process.env.WEB_APP_URL ?? 'http://localhost:5173';
+
+  if (oauthError || !code || typeof code !== 'string') {
+    return res.redirect(`${webAppUrl}/#settings?connect_error=access_denied`);
+  }
+
+  if (!req.session.gmailOAuthState || req.session.gmailOAuthState !== returnedState) {
+    return res.redirect(`${webAppUrl}/#settings?connect_error=state_mismatch`);
+  }
+
+  if (!req.session.userId) {
+    return res.redirect(`${webAppUrl}/?auth_error=session_expired`);
+  }
+
+  delete req.session.gmailOAuthState;
+
+  try {
+    const tokens = await exchangeGmailCode(code);
+    if (!tokens.idToken) throw new Error('No ID token in Gmail callback.');
+
+    const profile = await verifyIdToken(tokens.idToken);
+
+    const oauthClient = buildOAuth2Client(
+      tokens.accessToken,
+      tokens.refreshToken,
+      tokens.expiresAt,
+    );
+    const gmailProfile = await getProfile(oauthClient);
+    const gmailEmail = gmailProfile.emailAddress || profile.email;
+
+    const db = getDb();
+    const userId = req.session.userId;
+
+    const existing = db
+      .prepare(
+        'SELECT id FROM connected_google_accounts WHERE user_id = ? AND google_user_id = ?',
+      )
+      .get(userId, profile.sub) as { id: string } | undefined;
+
+    let accountId: string;
+    const isPrimary = !db
+      .prepare('SELECT id FROM connected_google_accounts WHERE user_id = ?')
+      .get(userId);
+
+    if (existing) {
+      accountId = existing.id;
+      db.prepare(
+        `UPDATE connected_google_accounts
+         SET email = ?, display_name = ?, avatar_url = ?
+         WHERE id = ?`,
+      ).run(gmailEmail, profile.name, profile.picture ?? null, accountId);
+    } else {
+      accountId = uuidv4();
+      db.prepare(
+        `INSERT INTO connected_google_accounts
+         (id, user_id, google_user_id, email, display_name, avatar_url, is_primary)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        accountId,
+        userId,
+        profile.sub,
+        gmailEmail,
+        profile.name,
+        profile.picture ?? null,
+        isPrimary ? 1 : 0,
+      );
+    }
+
+    const encAccess = encrypt(tokens.accessToken);
+    const encRefresh = encrypt(tokens.refreshToken);
+
+    const credExisting = db
+      .prepare('SELECT id FROM gmail_credentials WHERE connected_account_id = ?')
+      .get(accountId) as { id: string } | undefined;
+
+    if (credExisting) {
+      db.prepare(
+        `UPDATE gmail_credentials
+         SET access_token_enc = ?, refresh_token_enc = ?, expires_at = ?, scope = ?, updated_at = datetime('now')
+         WHERE connected_account_id = ?`,
+      ).run(encAccess, encRefresh, tokens.expiresAt, tokens.scope, accountId);
+    } else {
+      db.prepare(
+        `INSERT INTO gmail_credentials
+         (id, connected_account_id, access_token_enc, refresh_token_enc, expires_at, scope)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(uuidv4(), accountId, encAccess, encRefresh, tokens.expiresAt, tokens.scope);
+    }
+
+    console.log(`[accounts] Connected Gmail account: ${gmailEmail} for user ${userId}`);
+    res.redirect(`${webAppUrl}/#settings?connect_success=1`);
+  } catch (err) {
+    console.error('[accounts] connect/callback error:', err);
+    res.redirect(`${process.env.WEB_APP_URL ?? 'http://localhost:5173'}/#settings?connect_error=server_error`);
+  }
+});
+
+accountsRouter.delete('/:accountId', requireAuth, async (req: Request, res: Response) => {
+  const userId = req.session.userId as string;
+  const accountId = String(req.params['accountId']);
+  const db = getDb();
+
+  const account = db
+    .prepare(
+      'SELECT id FROM connected_google_accounts WHERE id = ? AND user_id = ?',
+    )
+    .get(accountId, userId) as { id: string } | undefined;
+
+  if (!account) {
+    return res.status(404).json({ error: 'Account not found.' });
+  }
+
+  try {
+    const cred = db
+      .prepare('SELECT access_token_enc FROM gmail_credentials WHERE connected_account_id = ?')
+      .get(accountId) as { access_token_enc: string } | undefined;
+
+    if (cred) {
+      const accessToken = decrypt(cred.access_token_enc);
+      const { OAuth2Client } = await import('google-auth-library');
+      const client = new OAuth2Client();
+      await client.revokeToken(accessToken);
+    }
+  } catch (e) {
+    console.warn('[accounts] Token revoke failed (non-fatal):', e);
+  }
+
+  db.prepare('DELETE FROM connected_google_accounts WHERE id = ?').run(accountId);
+
+  console.log(`[accounts] Disconnected account ${accountId} for user ${userId}`);
+  res.json({ ok: true });
+});

@@ -1,0 +1,4 @@
+[33m4d9b325[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m feat: add root vercel.json for direct deployment
+[33m5d9c40f[m fix: separate build and deploy jobs for GitHub Pages
+[33mea65f42[m fix: workflow build step
+[33m997162e[m feat: initial commit
