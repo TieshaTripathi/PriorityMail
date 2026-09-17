@@ -107,6 +107,10 @@ app.use('/api/classify', classifyRouter); // Legacy — kept for backward compat
 
 // ----------------------------------------------------------------
 // Start
-// ----------------------------------------------------------------
 const port = Number(process.env.PORT || 4000);
-app.listen(port, () => console.log(`PriorityMail API running on :${port}`));
+const host = process.env.HOST || '0.0.0.0';
+
+app.listen(port, host, () => {
+  console.log(`PriorityMail API running on http://${host}:${port}`);
+});
+

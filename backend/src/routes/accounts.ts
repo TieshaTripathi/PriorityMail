@@ -1,4 +1,4 @@
-import '../types/session.js';
+/// <reference path="../types/session.d.ts" />
 import { Router, type Request, type Response } from 'express';
 import { randomBytes } from 'node:crypto';
 import { v4 as uuidv4 } from 'uuid';
