@@ -16,7 +16,7 @@ export interface GmailWatchStatus {
   expiration?: string;
 }
 
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:4000';
+const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'https://priority-mail-zeta.vercel.app';
 
 /**
  * Service handling Gmail API operations and deep-linking into the Gmail app or web client.
@@ -31,13 +31,9 @@ export const GmailService = {
       const isLiveEnabled = process.env.EXPO_PUBLIC_ENABLE_LIVE_SYNC === 'true';
 
       if (isLiveEnabled) {
-        // Future production endpoint: exchange OAuth code via backend
-        const response = await fetch(`${API_BASE_URL}/auth/google/url`);
-        const data = await response.json();
-        if (data?.url) {
-          await Linking.openURL(data.url);
-          return { success: true };
-        }
+        // Direct browser / in-app browser redirect to backend Google OAuth
+        await Linking.openURL(`${API_BASE_URL}/api/auth/google`);
+        return { success: true };
       }
 
       // Default mock flow: simulate successful authorization

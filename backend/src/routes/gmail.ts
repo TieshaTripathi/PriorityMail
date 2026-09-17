@@ -118,90 +118,154 @@ function getUserClassificationData(userId: string) {
 }
 
 // ----------------------------------------------------------------
-// GET /api/gmail/:accountId/messages
+// Core helper: fetch, normalize, and classify emails for an account
+// ----------------------------------------------------------------
+async function fetchAccountEmails(
+  accountId: string,
+  userId: string,
+  maxResults = 20,
+) {
+  const authResult = await getAuthClient(accountId, userId);
+  if (!authResult) {
+    return null;
+  }
+
+  const { client, email: accountEmail } = authResult;
+  const { messageIds } = await listRecentMessages(client, maxResults);
+
+  if (messageIds.length === 0) {
+    return { emails: [], accountId, accountEmail };
+  }
+
+  const BATCH = 5;
+  const rawEmails = [];
+  for (let i = 0; i < messageIds.length; i += BATCH) {
+    const batch = messageIds.slice(i, i + BATCH);
+    const fetched = await Promise.all(
+      batch.map((id) => getMessage(client, id, accountId, accountEmail)),
+    );
+    rawEmails.push(...fetched);
+  }
+
+  const { rules, vipPeople } = getUserClassificationData(userId);
+  const classified = rawEmails.map((email) => {
+    const result = classifyEmail(
+      {
+        senderName: email.senderName,
+        senderEmail: email.senderEmail,
+        subject: email.subject,
+        snippet: email.snippet,
+        body: email.body,
+        labelIds: email.labelIds,
+      },
+      rules,
+      vipPeople,
+      'Balanced',
+    );
+
+    return {
+      id: email.gmailMessageId,
+      accountId,
+      accountEmail: email.accountEmail,
+      connectedAccountId: email.connectedAccountId,
+      gmailMessageId: email.gmailMessageId,
+      gmailThreadId: email.gmailThreadId,
+      senderName: email.senderName,
+      senderEmail: email.senderEmail,
+      subject: email.subject,
+      snippet: email.snippet,
+      body: email.body,
+      receivedAt: email.receivedAt,
+      labelIds: email.labelIds,
+      isRead: email.isRead,
+      isCompleted: false,
+      snoozedUntil: null,
+      priority: result.priority,
+      category: result.category,
+      actionRequired: result.actionRequired,
+      reason: result.reason,
+      reasons: result.reasons,
+      score: result.score,
+    };
+  });
+
+  classified.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  return { emails: classified, accountId, accountEmail };
+}
+
+// ----------------------------------------------------------------
+// GET /api/gmail/messages & /api/emails/priority — Fetch across ALL connected accounts
+// ----------------------------------------------------------------
+async function handleAllMessages(req: Request, res: Response) {
+  const { userId } = req.session as { userId: string };
+  const maxResults = Math.min(Number(req.query.max) || 20, 50);
+  const db = getDb();
+
+  const accounts = db
+    .prepare('SELECT id, email FROM connected_google_accounts WHERE user_id = ?')
+    .all(userId) as { id: string; email: string }[];
+
+  if (accounts.length === 0) {
+    return res.json({ emails: [], accounts: [] });
+  }
+
+  try {
+    const perAccountLimit = Math.max(5, Math.floor(maxResults / accounts.length));
+    const results = await Promise.all(
+      accounts.map((acc) => fetchAccountEmails(acc.id, userId, perAccountLimit)),
+    );
+
+    const allEmails = results
+      .filter((r): r is NonNullable<typeof r> => r !== null)
+      .flatMap((r) => r.emails);
+
+    allEmails.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+    res.json({ emails: allEmails, accounts });
+  } catch (err) {
+    console.error('[gmail] all messages error:', err);
+    res.status(500).json({ error: 'Failed to fetch messages across accounts.' });
+  }
+}
+
+gmailRouter.get('/messages', requireAuth, handleAllMessages);
+gmailRouter.get('/priority', requireAuth, handleAllMessages);
+
+// ----------------------------------------------------------------
+// POST /api/gmail/:accountId/sync — Manual sync trigger
+// ----------------------------------------------------------------
+gmailRouter.post('/:accountId/sync', requireAuth, async (req: Request, res: Response) => {
+  const { userId } = req.session as { userId: string };
+  const accountId = String(req.params.accountId);
+
+  try {
+    const data = await fetchAccountEmails(accountId, userId, 25);
+    if (!data) {
+      return res.status(404).json({ error: 'Account not found or expired.' });
+    }
+    res.json({ success: true, count: data.emails.length, syncedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('[gmail] sync error:', err);
+    res.status(500).json({ error: 'Sync failed.' });
+  }
+});
+
+// ----------------------------------------------------------------
+// GET /api/gmail/:accountId/messages — Specific account messages
 // ----------------------------------------------------------------
 gmailRouter.get('/:accountId/messages', requireAuth, async (req: Request, res: Response) => {
   const { userId } = req.session as { userId: string };
   const accountId = String(req.params.accountId);
   const maxResults = Math.min(Number(req.query.max) || 20, 50);
 
-  const authResult = await getAuthClient(accountId, userId);
-  if (!authResult) {
-    return res.status(404).json({
-      error: 'Account not found or credentials expired. Please reconnect.',
-    });
-  }
-
   try {
-    const { client, email: accountEmail } = authResult;
-
-    // Fetch message IDs
-    const { messageIds } = await listRecentMessages(client, maxResults);
-
-    if (messageIds.length === 0) {
-      return res.json({ emails: [], accountId, accountEmail });
+    const data = await fetchAccountEmails(accountId, userId, maxResults);
+    if (!data) {
+      return res.status(404).json({
+        error: 'Account not found or credentials expired. Please reconnect.',
+      });
     }
-
-    // Fetch messages in parallel (batched for safety)
-    const BATCH = 5;
-    const emails = [];
-    for (let i = 0; i < messageIds.length; i += BATCH) {
-      const batch = messageIds.slice(i, i + BATCH);
-      const fetched = await Promise.all(
-        batch.map((id) => getMessage(client, id, accountId, accountEmail)),
-      );
-      emails.push(...fetched);
-    }
-
-    // Classify each email
-    const { rules, vipPeople } = getUserClassificationData(userId);
-    const classified = emails.map((email) => {
-      const result = classifyEmail(
-        {
-          senderName: email.senderName,
-          senderEmail: email.senderEmail,
-          subject: email.subject,
-          snippet: email.snippet,
-          body: email.body,
-          labelIds: email.labelIds,
-        },
-        rules,
-        vipPeople,
-        'Balanced',
-      );
-
-      return {
-        // PriorityEmail fields
-        id: email.gmailMessageId,
-        accountId,
-        accountEmail: email.accountEmail,
-        connectedAccountId: email.connectedAccountId,
-        gmailMessageId: email.gmailMessageId,
-        gmailThreadId: email.gmailThreadId,
-        senderName: email.senderName,
-        senderEmail: email.senderEmail,
-        subject: email.subject,
-        snippet: email.snippet,
-        body: email.body,
-        receivedAt: email.receivedAt,
-        labelIds: email.labelIds,
-        isRead: email.isRead,
-        isCompleted: false,
-        snoozedUntil: null,
-        // Priority result
-        priority: result.priority,
-        category: result.category,
-        actionRequired: result.actionRequired,
-        reason: result.reason,
-        reasons: result.reasons,
-        score: result.score,
-      };
-    });
-
-    // Sort by priority score descending
-    classified.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-
-    res.json({ emails: classified, accountId, accountEmail });
+    res.json(data);
   } catch (err) {
     console.error('[gmail] messages error:', err);
     res.status(500).json({ error: 'Failed to fetch Gmail messages.' });

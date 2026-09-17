@@ -14,6 +14,7 @@ import { ConnectedAccountsList } from './components/ConnectedAccountsList';
 import {
   getConnectedAccounts,
   fetchGmailMessages,
+  fetchAllGmailMessages,
   type ConnectedAccountDto,
   type GmailEmailDto,
 } from './services/apiClient';
@@ -56,12 +57,12 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 // the existing email list UI.
 // ----------------------------------------------------------------
 function gmailDtoToEmail(dto: GmailEmailDto) {
+  const hasDeadline = dto.reasons?.some(r => r.toLowerCase().includes('deadline'));
   return {
     ...dto,
-    // Compute a human-readable receivedAt for display
     receivedAt: formatReceivedAt(dto.receivedAt),
     snoozedUntil: dto.snoozedUntil ?? null,
-    deadline: undefined,
+    deadline: hasDeadline ? 'Deadline detected' : undefined,
     body: dto.body,
     labelIds: dto.labelIds,
   };
@@ -119,10 +120,15 @@ function AppInner() {
 
   const tab = location.tab;
 
-  // Load connected accounts on mount
+  // Load connected accounts on mount, and automatically fetch real emails if connected
   useEffect(() => {
     getConnectedAccounts()
-      .then(setConnectedAccounts)
+      .then((accounts) => {
+        setConnectedAccounts(accounts);
+        if (accounts.length > 0) {
+          fetchRealEmails('all');
+        }
+      })
       .catch(() => { /* not critical */ });
   }, []);
 
@@ -131,8 +137,13 @@ function AppInner() {
     const params = new URLSearchParams(window.location.search);
     if (params.get('connect_success') === '1') {
       window.history.replaceState({}, '', window.location.pathname + window.location.hash);
-      setToast('Gmail account connected! Go to All Emails to fetch real messages.');
-      getConnectedAccounts().then(setConnectedAccounts).catch(() => {});
+      setToast('Gmail account connected! Fetching your real messages…');
+      getConnectedAccounts().then((accounts) => {
+        setConnectedAccounts(accounts);
+        if (accounts.length > 0) {
+          fetchRealEmails('all');
+        }
+      }).catch(() => {});
     }
     if (params.get('connect_error')) {
       window.history.replaceState({}, '', window.location.pathname + window.location.hash);
@@ -170,8 +181,8 @@ function AppInner() {
     snoozedUntil: snoozes[email.id] && Date.parse(snoozes[email.id]) > now ? snoozes[email.id] : null,
   })).sort((a, b) => (b.score || 0) - (a.score || 0)), [rules, people, settings.sensitivity, done, read, snoozes, now]);
 
-  // In "All Emails" with a real Gmail account selected, show Gmail emails
-  const realEmailsActive = tab === 'all' && gmailAccountId !== null && gmailEmails.length > 0;
+  // Real emails active when connected accounts exist and emails were fetched
+  const realEmailsActive = connectedAccounts.length > 0 && gmailEmails.length > 0;
 
   const baseEmails = realEmailsActive
     ? gmailEmails.map(gmailDtoToEmail).map(e => ({
@@ -182,10 +193,10 @@ function AppInner() {
       }))
     : mockEmails;
 
-  const active = mockEmails.filter(e => !e.isCompleted && !e.snoozedUntil && (e.priority === 'urgent' || e.priority === 'high'));
+  const active = baseEmails.filter(e => !e.isCompleted && !e.snoozedUntil && (e.priority === 'urgent' || e.priority === 'high' || e.actionRequired));
   const visible = (tab === 'inbox' ? active : baseEmails).filter(e =>
     (filter === 'all' || e.category === filter) &&
-    (account === 'all' || e.accountId === account) &&
+    (account === 'all' || e.accountId === account || ('connectedAccountId' in e && (e as unknown as { connectedAccountId: string }).connectedAccountId === account)) &&
     (status === 'all' || (status === 'done' ? e.isCompleted : status === 'snoozed' ? !!e.snoozedUntil : !e.isCompleted && !e.snoozedUntil)) &&
     `${e.subject} ${e.senderName} ${e.senderEmail} ${e.snippet}`.toLowerCase().includes(search.toLowerCase())
   );
@@ -215,17 +226,25 @@ function AppInner() {
   const greeting = new Date(now).getHours() < 12 ? 'Good morning' : new Date(now).getHours() < 17 ? 'Good afternoon' : 'Good evening';
   const userName = user?.displayName?.split(' ')[0] ?? 'there';
 
-  const fetchRealEmails = async (accountId: string) => {
+  const fetchRealEmails = async (accountId: string = 'all') => {
     setGmailLoading(true);
     setGmailError('');
     try {
-      const result = await fetchGmailMessages(accountId, 20);
-      setGmailEmails(result.emails);
-      setGmailAccountId(accountId);
-      setToast(`Fetched ${result.emails.length} real emails from ${result.accountEmail}.`);
+      if (accountId === 'all') {
+        const result = await fetchAllGmailMessages(30);
+        setGmailEmails(result.emails);
+        setGmailAccountId('all');
+        if (result.emails.length > 0) {
+          setToast(`Synced ${result.emails.length} emails across connected accounts.`);
+        }
+      } else {
+        const result = await fetchGmailMessages(accountId, 25);
+        setGmailEmails(result.emails);
+        setGmailAccountId(accountId);
+        setToast(`Synced ${result.emails.length} emails from ${result.accountEmail}.`);
+      }
     } catch {
-      setGmailError('Could not fetch Gmail messages. Check your connection and try again.');
-      setGmailEmails([]);
+      setGmailError('Could not fetch Gmail messages. Check your connection or reconnect in Settings.');
     } finally {
       setGmailLoading(false);
     }
@@ -253,10 +272,47 @@ function AppInner() {
       {updateReady && <div className="notice">An update is ready. Close all PriorityMail windows and reopen to update.</div>}
       {(tab === 'inbox' || tab === 'all') && <>
         <section className="page-heading"><div className="eyebrow">{tab === 'inbox' ? 'A LITTLE FOCUS. A LOT LESS NOISE.' : 'EVERY ACCOUNT, ONE PLACE'}</div><h1>{tab === 'inbox' ? <>{greeting},<br />{userName} <span className="hello">✦</span></> : 'All Emails'}</h1><p>{tab === 'inbox' ? 'Your important emails, without the noise.' : 'Find what you need. Leave the rest for later.'}</p></section>
+
+        {connectedAccounts.length === 0 && (
+          <div className="notice" style={{ background: '#f0f4ff', borderColor: '#d7e2fc', color: '#274488', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, borderRadius: 14, padding: 14, margin: '0 0 20px' }}>
+            <div>
+              <strong>Connect your Gmail</strong>
+              <p style={{ margin: '3px 0 0', fontSize: 12, opacity: 0.9 }}>Add your Gmail account in Settings to start filtering your real priority inbox.</p>
+            </div>
+            <button className="primary" style={{ minHeight: 38, padding: '8px 16px', fontSize: 12 }} onClick={() => navigate('settings')}>Connect Gmail</button>
+          </div>
+        )}
+
         {tab === 'inbox' && <><section className="stats" aria-label="Inbox summary">{[
           ['Needs attention', active.length, 'inbox'], ['Urgent', active.filter(e => e.priority === 'urgent').length, 'bell'], ['Deadlines', active.filter(e => e.deadline).length, 'clock'],
         ].map(([label, count, icon], i) => <div className={`stat stat-${i}`} key={String(label)}><Icon name={icon as IconName} /><strong>{count}</strong><span>{label}</span></div>)}</section><div className="focus-note"><span className="focus-dot" /><p>A calmer inbox starts here.<br /><strong>We've brought the important things forward.</strong></p></div></>}
-        <div className="section-title"><h2>{tab === 'inbox' ? 'Your priority list' : 'Your messages'}</h2><span>{visible.length} emails</span></div>
+
+        <div className="section-title">
+          <h2>{tab === 'inbox' ? 'Your priority list' : 'Your messages'}</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            {connectedAccounts.length > 0 && (
+              <button
+                type="button"
+                className="text-button blue"
+                style={{ minHeight: 32, padding: '4px 10px', fontSize: 12, background: '#eef3ff', borderRadius: 8 }}
+                onClick={() => fetchRealEmails(account === 'all' ? 'all' : account)}
+                disabled={gmailLoading}
+                aria-label="Sync emails"
+              >
+                <Icon name="refresh" />
+                <span>{gmailLoading ? 'Syncing…' : 'Sync'}</span>
+              </button>
+            )}
+            <span>{visible.length} emails</span>
+          </div>
+        </div>
+
+        {gmailLoading && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: '12px', background: '#f5f8ff', borderRadius: 12, margin: '10px 0', fontSize: 12, color: '#325df4' }}>
+            <span className="login-spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+            <span>Fetching and prioritizing recent Gmail messages…</span>
+          </div>
+        )}
         {tab === 'all' && <label className="search"><Icon name="search" /><input type="search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search sender or subject" aria-label="Search emails" /></label>}
         <div className="filter-row" aria-label="Filter category">{['all', 'work', 'college', 'internship', 'academic', 'personal'].map(c => <button key={c} className={`chip ${filter === c ? 'selected' : ''}`} aria-pressed={filter === c} onClick={() => setFilter(c)}>{c === 'all' ? 'All' : c}</button>)}</div>
         {tab === 'all' && <div className="select-row">

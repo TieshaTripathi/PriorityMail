@@ -166,6 +166,25 @@ export async function fetchGmailMessages(
   );
 }
 
+/** Fetch messages across all connected Gmail accounts. */
+export async function fetchAllGmailMessages(
+  max = 30,
+): Promise<{ emails: GmailEmailDto[]; accounts: { id: string; email: string }[] }> {
+  return apiFetch<{ emails: GmailEmailDto[]; accounts: { id: string; email: string }[] }>(
+    `/api/gmail/messages?max=${max}`,
+  );
+}
+
+/** Trigger a manual sync for an account. */
+export async function syncGmailAccount(
+  accountId: string,
+): Promise<{ success: boolean; count: number; syncedAt: string }> {
+  return apiFetch<{ success: boolean; count: number; syncedAt: string }>(
+    `/api/gmail/${encodeURIComponent(accountId)}/sync`,
+    { method: 'POST' },
+  );
+}
+
 export interface GmailLabel {
   id: string;
   name: string;

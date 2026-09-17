@@ -194,47 +194,72 @@ Repeat step 6–9 above. Each click of "Add Gmail Account" allows you to pick a 
 
 ---
 
-## Redirect URIs to Register in Google Cloud
+## Production Deployment & Architecture
 
-Add **exactly** these to your OAuth client's Authorized Redirect URIs:
+| Layer | Host | URL |
+|---|---|---|
+| **Web Frontend / PWA** | Vercel | [https://priority-mail-zeta.vercel.app](https://priority-mail-zeta.vercel.app) |
+| **Backend API** | Render | [https://prioritymail-ovda.onrender.com](https://prioritymail-ovda.onrender.com) |
 
+### Same-Origin API Architecture (iOS PWA & Safari ITP Compliance)
+To prevent cross-site 3rd-party cookie blocking on iOS Safari and installed PWAs:
+- Browser requests hit `https://priority-mail-zeta.vercel.app/api/...`
+- Vercel's Edge network rewrites and proxies `/api/*` to `https://prioritymail-ovda.onrender.com/api/*`
+- Session cookies (`pm.sid`) are stored as **1st-party cookies** on `priority-mail-zeta.vercel.app`, allowing seamless login and persistent authentication on iPhone Home Screen PWAs.
+
+---
+
+## iPhone PWA Installation
+
+PriorityMail is built as an installable Progressive Web App (PWA) with full offline support, app icons, and safe-area inset adaptation for iPhone:
+
+1. Open **Safari** on your iPhone.
+2. Navigate to: **`https://priority-mail-zeta.vercel.app`**
+3. Tap the **Share** button (the square with an arrow pointing up at the bottom bar).
+4. Scroll down in the share sheet and tap **Add to Home Screen**.
+5. Confirm the name **PriorityMail** and tap **Add** in the top right.
+6. Open PriorityMail from your Home Screen — it launches as a full standalone app without browser URL bars!
+
+---
+
+## Android APK Build (No Play Store Required)
+
+PriorityMail includes an installable Android build configuration using Expo EAS Build:
+
+1. Install EAS CLI (if not already installed):
+   ```bash
+   npm install -g eas-cli
+   ```
+2. Navigate to the mobile directory:
+   ```bash
+   cd mobile
+   ```
+3. Run the preview APK build:
+   ```bash
+   eas build --platform android --profile preview
+   ```
+4. EAS Build generates a standalone `.apk` package (`com.tiesha.prioritymail`).
+5. Download the `.apk` directly to your Android device and install it (enable "Install unknown apps" in Android settings if prompted).
+
+---
+
+## Google Cloud OAuth Redirect URIs
+
+Add both sets of URIs to your Google Cloud Console Web Application credentials:
+
+**Local Development:**
 ```
 http://localhost:4000/api/auth/google/callback
-http://localhost:4000/api/accounts/connect/callback
+http://localhost:4000/api/accounts/google/callback
 ```
 
-For production (replace with your actual domain):
+**Production (Same-Origin Vercel Proxy):**
 ```
-https://api.yourapp.com/api/auth/google/callback
-https://api.yourapp.com/api/accounts/connect/callback
+https://priority-mail-zeta.vercel.app/api/auth/google/callback
+https://priority-mail-zeta.vercel.app/api/accounts/google/callback
 ```
 
----
-
-## Security Model
-
-| What | Where | Protection |
-|---|---|---|
-| Google client secret | `backend/.env` only | Never in frontend code or git |
-| Gmail refresh tokens | SQLite DB | AES-256-GCM encrypted at rest |
-| User sessions | `express-session` + SQLite | httpOnly cookies, SameSite=lax |
-| Access tokens | Backend memory + DB | Auto-refreshed, never sent to client |
-| Scopes | Gmail read-only | No send, delete, or modify permissions |
-
----
-
-## What Is Still Mocked
-
-| Feature | Status |
-|---|---|
-| Priority Inbox | ✅ Mock emails (real classification engine) |
-| All Emails — real Gmail | ✅ Real when a Gmail account is connected |
-| Priority classification | ✅ Real (rule-based engine, no AI yet) |
-| Google login | ✅ Real OAuth |
-| Gmail account connection | ✅ Real OAuth |
-| Email read/done/snooze state | ⚠️ Stored locally in browser (not synced to DB yet) |
-| Push notifications | ⚠️ Mocked in-app |
-| Mobile app auth | ⚠️ Not implemented (API interfaces ready) |
+*(Direct Render URLs can also be registered as backup: `https://prioritymail-ovda.onrender.com/api/auth/google/callback` and `https://prioritymail-ovda.onrender.com/api/accounts/google/callback`)*
 
 ---
 
@@ -242,25 +267,36 @@ https://api.yourapp.com/api/accounts/connect/callback
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Health check |
-| `GET` | `/api/auth/google/login` | Get Google OAuth URL |
-| `GET` | `/api/auth/google/callback` | OAuth callback (from Google) |
-| `POST` | `/api/auth/logout` | Destroy session |
-| `GET` | `/api/auth/me` | Current user or 401 |
-| `GET` | `/api/accounts` | List connected Gmail accounts |
-| `POST` | `/api/accounts/connect/start` | Start Gmail OAuth |
-| `GET` | `/api/accounts/connect/callback` | Gmail OAuth callback |
-| `DELETE` | `/api/accounts/:id` | Disconnect account |
-| `GET` | `/api/gmail/:accountId/messages` | Fetch + classify emails |
-| `GET` | `/api/gmail/:accountId/labels` | List Gmail labels |
-| `POST` | `/api/classify` | Legacy: classify a single email |
+| `GET` | `/api/health` | Service health check (`{"status":"ok"}`) |
+| `GET` | `/api/auth/google` | Direct browser navigation for Google login |
+| `GET` | `/api/auth/google/callback` | OAuth login callback from Google |
+| `GET` | `/api/auth/me` | Current authenticated user profile |
+| `POST` | `/api/auth/logout` | Destroy session and clear cookies |
+| `GET` | `/api/accounts` | List connected Gmail accounts (`/api/accounts/connected`) |
+| `GET` | `/api/accounts/google/connect` | Connect a new Gmail account via OAuth |
+| `GET` | `/api/accounts/google/callback` | Gmail OAuth connection callback |
+| `DELETE` | `/api/accounts/:id` | Disconnect Gmail account and revoke token |
+| `GET` | `/api/gmail/messages` | Fetch & classify emails across all connected accounts (`/api/emails/priority`) |
+| `GET` | `/api/gmail/:accountId/messages` | Fetch & classify emails for a specific account |
+| `POST` | `/api/gmail/:accountId/sync` | Manually trigger message sync for an account |
+| `GET` | `/api/gmail/:accountId/labels` | List Gmail labels for an account |
 
 ---
 
-## Next Milestone Suggestions
+## Security Model
 
-1. **Persist email state** — sync read/done/snoozed state to backend DB per user
-2. **Priority Inbox with real Gmail** — replace mock inbox with real emails
-3. **Mobile auth** — implement the same backend OAuth flow in the Expo app
-4. **Gmail push notifications** — use Gmail Pub/Sub watch for real-time updates
-5. **AI classification** — feed emails to Gemini API for enhanced priority scoring
+| Component | Location | Implementation |
+|---|---|---|
+| **OAuth Credentials** | Render Environment | `GOOGLE_CLIENT_ID` & `GOOGLE_CLIENT_SECRET` never bundled in frontend code |
+| **Gmail Refresh Tokens** | SQLite DB | AES-256-GCM encrypted with `TOKEN_ENCRYPTION_KEY` |
+| **Session Cookies** | Browser & Server | `httpOnly: true`, `secure: true`, `sameSite: 'none'` (with `trust proxy: 1`) |
+| **Access Tokens** | Server-side Memory | Auto-refreshed before expiration, never exposed to client |
+| **Permissions** | Google OAuth | Read-only Gmail (`gmail.readonly`, `gmail.labels`) — zero send/delete access |
+
+---
+
+## Database & Render Free Tier Notes
+
+- PriorityMail uses Node.js 22 built-in `node:sqlite` module without native C++ compilation dependencies.
+- **Render Free Tier Storage**: Render free web services have an ephemeral filesystem (the SQLite file resets if the service restarts or redeploys). For persistent SQLite, attach a Render Persistent Disk mounted at `/var/data` and set `DATABASE_PATH=/var/data/prioritymail.db`.
+- **Recommended Next Production Step**: Migrate database layer to managed PostgreSQL (e.g. Neon or Supabase free tier) for multi-instance scaling and persistence.

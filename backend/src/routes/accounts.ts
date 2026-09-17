@@ -22,7 +22,7 @@ function requireAuth(req: Request, res: Response, next: () => void) {
   next();
 }
 
-accountsRouter.get('/', requireAuth, (req: Request, res: Response) => {
+function listAccounts(req: Request, res: Response) {
   const userId = req.session.userId as string;
   const db = getDb();
 
@@ -56,7 +56,10 @@ accountsRouter.get('/', requireAuth, (req: Request, res: Response) => {
       createdAt: a.created_at,
     })),
   );
-});
+}
+
+accountsRouter.get('/', requireAuth, listAccounts);
+accountsRouter.get('/connected', requireAuth, listAccounts);
 
 function getFrontendUrl(): string {
   const url =

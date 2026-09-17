@@ -5,6 +5,7 @@
     { "source": "/(.*)", "headers": [{ "key": "X-Content-Type-Options", "value": "nosniff" }, { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }] }
   ],
   "rewrites": [
+    { "source": "/api/(.*)", "destination": "https://prioritymail-ovda.onrender.com/api/$1" },
     { "source": "/((?!assets/|icons/|sw\\.js|manifest\\.webmanifest).*)$", "destination": "/index.html" }
   ]
 }

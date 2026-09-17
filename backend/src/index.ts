@@ -103,6 +103,7 @@ app.get('/health', (_req, res) => {
 app.use('/api/auth', authRouter);
 app.use('/api/accounts', accountsRouter);
 app.use('/api/gmail', gmailRouter);
+app.use('/api/emails', gmailRouter); // Mobile app compatibility
 app.use('/api/classify', classifyRouter); // Legacy — kept for backward compat
 
 // ----------------------------------------------------------------
