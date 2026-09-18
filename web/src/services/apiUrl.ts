@@ -10,18 +10,23 @@ export function getApiBaseUrl(): string {
     (import.meta.env.VITE_API_URL as string | undefined) ||
     (import.meta.env.VITE_API_BASE_URL as string | undefined);
 
-  // In browser environments on Vercel or localhost, prefer same-origin relative URLs ('')
-  // so API requests go through the same origin (Vercel proxy / Vite dev proxy),
-  // ensuring session cookies are treated as 1st-party on iOS Safari and PWA mode.
+  if (envUrl && envUrl.trim().length > 0) {
+    return envUrl.trim().replace(/\/+$/, '');
+  }
+
+  // In production on Vercel, point directly to the Render backend where
+  // Google OAuth callbacks land and set session cookies (SameSite=None; Secure).
   if (typeof window !== 'undefined' && window.location) {
     const host = window.location.hostname;
-    if (host.endsWith('vercel.app') || host === 'localhost' || host === '127.0.0.1') {
-      return '';
+    if (host.endsWith('vercel.app')) {
+      return 'https://prioritymail-ovda.onrender.com';
+    }
+    if (host === 'localhost' || host === '127.0.0.1') {
+      return 'http://localhost:4000';
     }
   }
 
-  const url = (envUrl && envUrl.trim().length > 0) ? envUrl.trim() : '';
-  return url.replace(/\/+$/, '');
+  return 'https://prioritymail-ovda.onrender.com';
 }
 
 /**

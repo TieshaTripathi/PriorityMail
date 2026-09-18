@@ -141,6 +141,7 @@ export interface GmailEmailDto {
   receivedAt: string;
   labelIds: string[];
   isRead: boolean;
+  isImportant?: boolean;
   isCompleted: boolean;
   snoozedUntil: null;
   priority: 'urgent' | 'high' | 'normal' | 'fyi';
@@ -181,6 +182,14 @@ export async function syncGmailAccount(
 ): Promise<{ success: boolean; count: number; syncedAt: string }> {
   return apiFetch<{ success: boolean; count: number; syncedAt: string }>(
     `/api/gmail/${encodeURIComponent(accountId)}/sync`,
+    { method: 'POST' },
+  );
+}
+
+/** Trigger a manual sync across all connected accounts. */
+export async function syncAllGmailAccounts(): Promise<{ success: boolean; count: number; syncedAt: string }> {
+  return apiFetch<{ success: boolean; count: number; syncedAt: string }>(
+    '/api/gmail/sync',
     { method: 'POST' },
   );
 }

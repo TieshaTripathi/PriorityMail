@@ -29,7 +29,10 @@ app.set('trust proxy', 1);
 // ----------------------------------------------------------------
 // CORS — allow the web app origin to send credentials
 // ----------------------------------------------------------------
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction =
+  process.env.NODE_ENV === 'production' ||
+  Boolean(process.env.RENDER) ||
+  Boolean(process.env.RENDER_EXTERNAL_URL);
 
 const configuredOrigins = [
   process.env.FRONTEND_URL,

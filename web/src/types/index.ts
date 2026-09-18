@@ -30,9 +30,11 @@ export interface PriorityEmail {
   deadline?: string;
   gmailThreadId: string;
   isRead: boolean;
+  isImportant?: boolean;
   isCompleted: boolean;
   snoozedUntil?: string | null;
   score?: number;
+  labelIds?: string[];
 }
 
 export type PriorityRuleType =

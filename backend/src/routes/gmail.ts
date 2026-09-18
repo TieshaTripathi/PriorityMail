@@ -178,6 +178,7 @@ async function fetchAccountEmails(
       receivedAt: email.receivedAt,
       labelIds: email.labelIds,
       isRead: email.isRead,
+      isImportant: email.labelIds.includes('IMPORTANT') || result.priority === 'urgent' || result.priority === 'high',
       isCompleted: false,
       snoozedUntil: null,
       priority: result.priority,
@@ -232,7 +233,7 @@ gmailRouter.get('/messages', requireAuth, handleAllMessages);
 gmailRouter.get('/priority', requireAuth, handleAllMessages);
 
 // ----------------------------------------------------------------
-// POST /api/gmail/:accountId/sync — Manual sync trigger
+// POST /api/gmail/:accountId/sync — Manual sync trigger for single account
 // ----------------------------------------------------------------
 gmailRouter.post('/:accountId/sync', requireAuth, async (req: Request, res: Response) => {
   const { userId } = req.session as { userId: string };
@@ -247,6 +248,35 @@ gmailRouter.post('/:accountId/sync', requireAuth, async (req: Request, res: Resp
   } catch (err) {
     console.error('[gmail] sync error:', err);
     res.status(500).json({ error: 'Sync failed.' });
+  }
+});
+
+// ----------------------------------------------------------------
+// POST /api/gmail/sync — Manual sync trigger across ALL connected accounts
+// ----------------------------------------------------------------
+gmailRouter.post('/sync', requireAuth, async (req: Request, res: Response) => {
+  const { userId } = req.session as { userId: string };
+  const db = getDb();
+  const accounts = db
+    .prepare('SELECT id, email FROM connected_google_accounts WHERE user_id = ?')
+    .all(userId) as { id: string; email: string }[];
+
+  if (accounts.length === 0) {
+    return res.json({ success: true, count: 0, syncedAt: new Date().toISOString() });
+  }
+
+  try {
+    const results = await Promise.all(
+      accounts.map((acc) => fetchAccountEmails(acc.id, userId, 25)),
+    );
+    const totalCount = results
+      .filter((r): r is NonNullable<typeof r> => r !== null)
+      .reduce((sum, r) => sum + r.emails.length, 0);
+
+    res.json({ success: true, count: totalCount, syncedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('[gmail] sync all error:', err);
+    res.status(500).json({ error: 'Sync failed across connected accounts.' });
   }
 });
 

@@ -201,6 +201,9 @@ async function handleGmailCallback(req: Request, res: Response) {
     }
 
     console.log(`[accounts] Connected Gmail account: ${gmailEmail} for user ${userId}`);
+    await new Promise<void>((resolve) => {
+      req.session.save(() => resolve());
+    });
     res.redirect(`${frontendUrl}/#settings?connect_success=1`);
   } catch (err) {
     console.error('[accounts] connect callback error:', err);
