@@ -1,5 +1,8 @@
 // PriorityMail backend — Gmail Fetch Routes
-// GET /api/gmail/:accountId/messages  → fetch, normalize, classify emails
+// GET /api/gmail/messages             → fetch, normalize, classify emails across all accounts
+// GET /api/gmail/:accountId/messages  → fetch, normalize, classify emails for a specific account
+// POST /api/gmail/sync                → trigger manual sync across all accounts
+// POST /api/gmail/:accountId/sync     → trigger manual sync for an account
 // GET /api/gmail/:accountId/labels    → list Gmail labels
 
 import { Router, type Request, type Response } from 'express';
@@ -30,25 +33,24 @@ function requireAuth(req: Request, res: Response, next: () => void) {
 
 // ----------------------------------------------------------------
 // Helper: get a valid OAuth2Client for a connected account,
-// auto-refreshing the access token if it has expired.
+// auto-refreshing the access token if expired.
 // ----------------------------------------------------------------
 async function getAuthClient(accountId: string, userId: string) {
   const db = getDb();
 
-  const account = db
-    .prepare(
-      `SELECT cga.id, cga.email, gc.access_token_enc, gc.refresh_token_enc, gc.expires_at
-       FROM connected_google_accounts cga
-       JOIN gmail_credentials gc ON gc.connected_account_id = cga.id
-       WHERE cga.id = ? AND cga.user_id = ?`,
-    )
-    .get(accountId, userId) as {
-      id: string;
-      email: string;
-      access_token_enc: string;
-      refresh_token_enc: string;
-      expires_at: string;
-    } | undefined;
+  const account = await db.queryOne<{
+    id: string;
+    email: string;
+    access_token_enc: string;
+    refresh_token_enc: string;
+    expires_at: string;
+  }>(
+    `SELECT cga.id, cga.email, gc.access_token_enc, gc.refresh_token_enc, gc.expires_at
+     FROM connected_google_accounts cga
+     JOIN gmail_credentials gc ON gc.connected_account_id = cga.id
+     WHERE cga.id = ? AND cga.user_id = ?`,
+    [accountId, userId],
+  );
 
   if (!account) return null;
 
@@ -62,12 +64,12 @@ async function getAuthClient(accountId: string, userId: string) {
       const refreshed = await refreshAccessToken(refreshToken);
       accessToken = refreshed.accessToken;
       expiresAt = refreshed.expiresAt;
-      // Update stored token
-      db.prepare(
+      await db.execute(
         `UPDATE gmail_credentials
-         SET access_token_enc = ?, expires_at = ?, updated_at = datetime('now')
+         SET access_token_enc = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP
          WHERE connected_account_id = ?`,
-      ).run(encrypt(accessToken), expiresAt, accountId);
+        [encrypt(accessToken), expiresAt, accountId],
+      );
     } catch (e) {
       console.error('[gmail] Token refresh failed:', e);
       return null;
@@ -83,27 +85,27 @@ async function getAuthClient(accountId: string, userId: string) {
 // ----------------------------------------------------------------
 // Helper: load user's rules and VIP people for classification
 // ----------------------------------------------------------------
-function getUserClassificationData(userId: string) {
+async function getUserClassificationData(userId: string) {
   const db = getDb();
-  const rules = db
-    .prepare('SELECT * FROM priority_rules WHERE user_id = ? AND enabled = 1')
-    .all(userId) as {
-      id: string;
-      type: string;
-      value: string;
-      weight: number;
-      enabled: number;
-      description: string | null;
-    }[];
+  const rules = await db.query<{
+    id: string;
+    type: string;
+    value: string;
+    weight: number;
+    enabled: number;
+    description: string | null;
+  }>('SELECT * FROM priority_rules WHERE user_id = ? AND enabled = 1', [userId]);
 
-  const vip = db
-    .prepare('SELECT * FROM vip_senders WHERE user_id = ?')
-    .all(userId) as {
-      id: string;
-      name: string;
-      email: string;
-      category: string;
-    }[];
+  const vip = await db.query<{
+    id: string;
+    name: string;
+    email: string;
+    category: string;
+  }>('SELECT * FROM vip_senders WHERE user_id = ?', [userId]);
+
+  const settings = await db.queryOne<{
+    sensitivity: string;
+  }>('SELECT sensitivity FROM user_settings WHERE user_id = ?', [userId]);
 
   return {
     rules: rules.map((r) => ({
@@ -114,6 +116,7 @@ function getUserClassificationData(userId: string) {
       enabled: Boolean(r.enabled),
     })),
     vipPeople: vip,
+    sensitivity: (settings?.sensitivity as any) || 'Balanced',
   };
 }
 
@@ -123,7 +126,7 @@ function getUserClassificationData(userId: string) {
 async function fetchAccountEmails(
   accountId: string,
   userId: string,
-  maxResults = 20,
+  maxResults = 25,
 ) {
   const authResult = await getAuthClient(accountId, userId);
   if (!authResult) {
@@ -147,7 +150,9 @@ async function fetchAccountEmails(
     rawEmails.push(...fetched);
   }
 
-  const { rules, vipPeople } = getUserClassificationData(userId);
+  const { rules, vipPeople, sensitivity } = await getUserClassificationData(userId);
+  const DEADLINE_REGEX = /\b(deadline|closes tomorrow|closing tomorrow|due by|due tomorrow|submission deadline|expires|last date)\b/i;
+
   const classified = rawEmails.map((email) => {
     const result = classifyEmail(
       {
@@ -160,8 +165,12 @@ async function fetchAccountEmails(
       },
       rules,
       vipPeople,
-      'Balanced',
+      sensitivity,
     );
+
+    const hasDeadline =
+      DEADLINE_REGEX.test(`${email.subject} ${email.snippet} ${email.body || ''}`) ||
+      result.reasons.some((r) => r.toLowerCase().includes('deadline'));
 
     return {
       id: email.gmailMessageId,
@@ -178,7 +187,10 @@ async function fetchAccountEmails(
       receivedAt: email.receivedAt,
       labelIds: email.labelIds,
       isRead: email.isRead,
-      isImportant: email.labelIds.includes('IMPORTANT') || result.priority === 'urgent' || result.priority === 'high',
+      isImportant:
+        email.labelIds.includes('IMPORTANT') ||
+        result.priority === 'urgent' ||
+        result.priority === 'high',
       isCompleted: false,
       snoozedUntil: null,
       priority: result.priority,
@@ -187,6 +199,7 @@ async function fetchAccountEmails(
       reason: result.reason,
       reasons: result.reasons,
       score: result.score,
+      deadline: hasDeadline ? 'Deadline detected' : undefined,
     };
   });
 
@@ -199,12 +212,13 @@ async function fetchAccountEmails(
 // ----------------------------------------------------------------
 async function handleAllMessages(req: Request, res: Response) {
   const { userId } = req.session as { userId: string };
-  const maxResults = Math.min(Number(req.query.max) || 20, 50);
+  const maxResults = Math.min(Number(req.query.max) || 25, 50);
   const db = getDb();
 
-  const accounts = db
-    .prepare('SELECT id, email FROM connected_google_accounts WHERE user_id = ?')
-    .all(userId) as { id: string; email: string }[];
+  const accounts = await db.query<{ id: string; email: string }>(
+    'SELECT id, email FROM connected_google_accounts WHERE user_id = ?',
+    [userId],
+  );
 
   if (accounts.length === 0) {
     return res.json({ emails: [], accounts: [] });
@@ -244,7 +258,12 @@ gmailRouter.post('/:accountId/sync', requireAuth, async (req: Request, res: Resp
     if (!data) {
       return res.status(404).json({ error: 'Account not found or expired.' });
     }
-    res.json({ success: true, count: data.emails.length, syncedAt: new Date().toISOString() });
+    res.json({
+      success: true,
+      count: data.emails.length,
+      syncedAt: new Date().toISOString(),
+      accountEmail: data.accountEmail,
+    });
   } catch (err) {
     console.error('[gmail] sync error:', err);
     res.status(500).json({ error: 'Sync failed.' });
@@ -257,9 +276,10 @@ gmailRouter.post('/:accountId/sync', requireAuth, async (req: Request, res: Resp
 gmailRouter.post('/sync', requireAuth, async (req: Request, res: Response) => {
   const { userId } = req.session as { userId: string };
   const db = getDb();
-  const accounts = db
-    .prepare('SELECT id, email FROM connected_google_accounts WHERE user_id = ?')
-    .all(userId) as { id: string; email: string }[];
+  const accounts = await db.query<{ id: string; email: string }>(
+    'SELECT id, email FROM connected_google_accounts WHERE user_id = ?',
+    [userId],
+  );
 
   if (accounts.length === 0) {
     return res.json({ success: true, count: 0, syncedAt: new Date().toISOString() });
@@ -286,13 +306,13 @@ gmailRouter.post('/sync', requireAuth, async (req: Request, res: Response) => {
 gmailRouter.get('/:accountId/messages', requireAuth, async (req: Request, res: Response) => {
   const { userId } = req.session as { userId: string };
   const accountId = String(req.params.accountId);
-  const maxResults = Math.min(Number(req.query.max) || 20, 50);
+  const maxResults = Math.min(Number(req.query.max) || 25, 50);
 
   try {
     const data = await fetchAccountEmails(accountId, userId, maxResults);
     if (!data) {
       return res.status(404).json({
-        error: 'Account not found or credentials expired. Please reconnect.',
+        error: 'Account not found or credentials expired. Please reconnect in Settings.',
       });
     }
     res.json(data);

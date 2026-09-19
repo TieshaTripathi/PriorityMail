@@ -1,40 +1,144 @@
-// PriorityMail backend — SQLite database initializer
-// Uses Node.js 22's built-in node:sqlite module.
-// No native compilation required — works on all platforms.
-
-// node:sqlite is available in Node.js >= 22.5.0 (flag: --experimental-sqlite)
-// In Node.js >= 22.12.0 it's unflagged.
-// We use --experimental-sqlite via the tsx invocation flag in start scripts.
+// PriorityMail backend — Unified Database Layer
+// Supports PostgreSQL in production (via pg.Pool) and SQLite in local development (via node:sqlite).
+// Safe, parameterized queries with automatic SQL dialect mapping (? -> $1, $2, ... for PostgreSQL).
 
 import { DatabaseSync } from 'node:sqlite';
+import pg from 'pg';
 import path from 'node:path';
 import fs from 'node:fs';
 import { runMigrations } from './migrations.js';
 
-const DEFAULT_DB_PATH = './data/prioritymail.db';
+const { Pool } = pg;
 
-let db: DatabaseSync | null = null;
+export interface Database {
+  isPostgres: boolean;
+  query<T = any>(sql: string, params?: any[]): Promise<T[]>;
+  queryOne<T = any>(sql: string, params?: any[]): Promise<T | null>;
+  execute(sql: string, params?: any[]): Promise<void>;
+  execScript(script: string): Promise<void>;
+  close(): Promise<void>;
+}
 
-export function getDb(): DatabaseSync {
-  if (db) return db;
+let dbInstance: Database | null = null;
+let pgPoolInstance: pg.Pool | null = null;
 
-  const dbPath = process.env.DATABASE_PATH ?? DEFAULT_DB_PATH;
+export function getPgPool(): pg.Pool | null {
+  return pgPoolInstance;
+}
+
+class PostgresDatabase implements Database {
+  readonly isPostgres = true;
+
+  constructor(private pool: pg.Pool) {}
+
+  private prepareSql(sql: string): string {
+    let index = 0;
+    return sql.replace(/\?/g, () => `$${++index}`);
+  }
+
+  async query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    const pgSql = this.prepareSql(sql);
+    const result = await this.pool.query(pgSql, params);
+    return result.rows as T[];
+  }
+
+  async queryOne<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+    const rows = await this.query<T>(sql, params);
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  async execute(sql: string, params: any[] = []): Promise<void> {
+    const pgSql = this.prepareSql(sql);
+    await this.pool.query(pgSql, params);
+  }
+
+  async execScript(script: string): Promise<void> {
+    await this.pool.query(script);
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+}
+
+class SqliteDatabase implements Database {
+  readonly isPostgres = false;
+
+  constructor(private sqlite: DatabaseSync) {}
+
+  async query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    const stmt = this.sqlite.prepare(sql);
+    return stmt.all(...params) as T[];
+  }
+
+  async queryOne<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+    const stmt = this.sqlite.prepare(sql);
+    const row = stmt.get(...params);
+    return (row ?? null) as T | null;
+  }
+
+  async execute(sql: string, params: any[] = []): Promise<void> {
+    const stmt = this.sqlite.prepare(sql);
+    stmt.run(...params);
+  }
+
+  async execScript(script: string): Promise<void> {
+    this.sqlite.exec(script);
+  }
+
+  async close(): Promise<void> {
+    this.sqlite.close();
+  }
+}
+
+export async function initDb(): Promise<Database> {
+  if (dbInstance) return dbInstance;
+
+  const databaseUrl = process.env.DATABASE_URL;
+
+  if (databaseUrl) {
+    console.log('[db] Initializing PostgreSQL connection from DATABASE_URL...');
+    const pool = new Pool({
+      connectionString: databaseUrl,
+      ssl: databaseUrl.includes('localhost') ? false : { rejectUnauthorized: false },
+      max: 10,
+      idleTimeoutMillis: 30000,
+    });
+
+    pgPoolInstance = pool;
+    const pgDb = new PostgresDatabase(pool);
+
+    // Verify connectivity
+    await pgDb.queryOne('SELECT 1');
+    await runMigrations(pgDb);
+    dbInstance = pgDb;
+    console.log('[db] PostgreSQL initialized and migrations applied.');
+    return dbInstance;
+  }
+
+  const defaultDbPath = './data/prioritymail.db';
+  const dbPath = process.env.DATABASE_PATH ?? defaultDbPath;
   const dir = path.dirname(dbPath);
 
-  // Ensure the directory exists before opening
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 
-  db = new DatabaseSync(dbPath);
+  console.log(`[db] Initializing local SQLite database at ${path.resolve(dbPath)}...`);
+  const sqlite = new DatabaseSync(dbPath);
+  sqlite.exec('PRAGMA journal_mode = WAL');
+  sqlite.exec('PRAGMA foreign_keys = ON');
 
-  // Enable WAL mode for better concurrent read performance
-  db.exec('PRAGMA journal_mode = WAL');
-  // Enforce FK constraints
-  db.exec('PRAGMA foreign_keys = ON');
+  const sqliteDb = new SqliteDatabase(sqlite);
+  await runMigrations(sqliteDb);
+  dbInstance = sqliteDb;
+  console.log('[db] SQLite initialized and migrations applied.');
+  return dbInstance;
+}
 
-  runMigrations(db);
-
-  console.log(`[db] SQLite opened at ${path.resolve(dbPath)}`);
-  return db;
+export function getDb(): Database {
+  if (!dbInstance) {
+    throw new Error('[db] Database not initialized. Call initDb() on server startup.');
+  }
+  return dbInstance;
 }

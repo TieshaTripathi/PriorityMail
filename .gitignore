@@ -12,11 +12,21 @@ web-build/
 android/
 ios/
 
-# Environment Variables — NEVER commit these
+# Environment Variables & Secrets — NEVER commit these
 .env
-.env.local
-.env.*.local
+.env*
+!.env.example
 *.env
+**/.env
+**/.env*
+!**/.env.example
+*.key
+*.pem
+*.cert
+
+# Supabase Local Cache & State
+.branches/
+.temp/
 
 # SQLite database (contains user data and encrypted tokens)
 backend/data/

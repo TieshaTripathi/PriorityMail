@@ -11,6 +11,7 @@ import {
 import { getProfile } from '../services/gmailService.js';
 import { encrypt, decrypt } from '../services/encryption.js';
 import { getDb } from '../db/database.js';
+import { setupWatchForAccount } from '../services/watchService.js';
 
 export const accountsRouter = Router();
 
@@ -22,18 +23,12 @@ function requireAuth(req: Request, res: Response, next: () => void) {
   next();
 }
 
-function listAccounts(req: Request, res: Response) {
+async function listAccounts(req: Request, res: Response) {
   const userId = req.session.userId as string;
   const db = getDb();
 
-  const accounts = db
-    .prepare(
-      `SELECT id, user_id, google_user_id, email, display_name, avatar_url, is_primary, created_at
-       FROM connected_google_accounts
-       WHERE user_id = ?
-       ORDER BY is_primary DESC, created_at ASC`,
-    )
-    .all(userId) as {
+  try {
+    const accounts = await db.query<{
       id: string;
       user_id: string;
       google_user_id: string;
@@ -42,20 +37,30 @@ function listAccounts(req: Request, res: Response) {
       avatar_url: string | null;
       is_primary: number;
       created_at: string;
-    }[];
+    }>(
+      `SELECT id, user_id, google_user_id, email, display_name, avatar_url, is_primary, created_at
+       FROM connected_google_accounts
+       WHERE user_id = ?
+       ORDER BY is_primary DESC, created_at ASC`,
+      [userId],
+    );
 
-  res.json(
-    accounts.map((a) => ({
-      id: a.id,
-      userId: a.user_id,
-      googleUserId: a.google_user_id,
-      email: a.email,
-      displayName: a.display_name,
-      avatarUrl: a.avatar_url ?? undefined,
-      isPrimary: Boolean(a.is_primary),
-      createdAt: a.created_at,
-    })),
-  );
+    res.json(
+      accounts.map((a) => ({
+        id: a.id,
+        userId: a.user_id,
+        googleUserId: a.google_user_id,
+        email: a.email,
+        displayName: a.display_name,
+        avatarUrl: a.avatar_url ?? undefined,
+        isPrimary: Boolean(a.is_primary),
+        createdAt: a.created_at,
+      })),
+    );
+  } catch (err) {
+    console.error('[accounts] listAccounts error:', err);
+    res.status(500).json({ error: 'Failed to list connected accounts.' });
+  }
 }
 
 accountsRouter.get('/', requireAuth, listAccounts);
@@ -144,63 +149,75 @@ async function handleGmailCallback(req: Request, res: Response) {
     const db = getDb();
     const userId = req.session.userId;
 
-    const existing = db
-      .prepare(
-        'SELECT id FROM connected_google_accounts WHERE user_id = ? AND google_user_id = ?',
-      )
-      .get(userId, profile.sub) as { id: string } | undefined;
+    const existing = await db.queryOne<{ id: string }>(
+      'SELECT id FROM connected_google_accounts WHERE user_id = ? AND google_user_id = ?',
+      [userId, profile.sub],
+    );
 
     let accountId: string;
-    const isPrimary = !db
-      .prepare('SELECT id FROM connected_google_accounts WHERE user_id = ?')
-      .get(userId);
+    const hasAnyAccount = await db.queryOne<{ id: string }>(
+      'SELECT id FROM connected_google_accounts WHERE user_id = ?',
+      [userId],
+    );
+    const isPrimary = !hasAnyAccount;
 
     if (existing) {
       accountId = existing.id;
-      db.prepare(
+      await db.execute(
         `UPDATE connected_google_accounts
          SET email = ?, display_name = ?, avatar_url = ?
          WHERE id = ?`,
-      ).run(gmailEmail, profile.name, profile.picture ?? null, accountId);
+        [gmailEmail, profile.name, profile.picture ?? null, accountId],
+      );
     } else {
       accountId = uuidv4();
-      db.prepare(
+      await db.execute(
         `INSERT INTO connected_google_accounts
          (id, user_id, google_user_id, email, display_name, avatar_url, is_primary)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        accountId,
-        userId,
-        profile.sub,
-        gmailEmail,
-        profile.name,
-        profile.picture ?? null,
-        isPrimary ? 1 : 0,
+        [
+          accountId,
+          userId,
+          profile.sub,
+          gmailEmail,
+          profile.name,
+          profile.picture ?? null,
+          isPrimary ? 1 : 0,
+        ],
       );
     }
 
     const encAccess = encrypt(tokens.accessToken);
     const encRefresh = encrypt(tokens.refreshToken);
 
-    const credExisting = db
-      .prepare('SELECT id FROM gmail_credentials WHERE connected_account_id = ?')
-      .get(accountId) as { id: string } | undefined;
+    const credExisting = await db.queryOne<{ id: string }>(
+      'SELECT id FROM gmail_credentials WHERE connected_account_id = ?',
+      [accountId],
+    );
 
     if (credExisting) {
-      db.prepare(
+      await db.execute(
         `UPDATE gmail_credentials
-         SET access_token_enc = ?, refresh_token_enc = ?, expires_at = ?, scope = ?, updated_at = datetime('now')
+         SET access_token_enc = ?, refresh_token_enc = ?, expires_at = ?, scope = ?, updated_at = CURRENT_TIMESTAMP
          WHERE connected_account_id = ?`,
-      ).run(encAccess, encRefresh, tokens.expiresAt, tokens.scope, accountId);
+        [encAccess, encRefresh, tokens.expiresAt, tokens.scope, accountId],
+      );
     } else {
-      db.prepare(
+      await db.execute(
         `INSERT INTO gmail_credentials
          (id, connected_account_id, access_token_enc, refresh_token_enc, expires_at, scope)
          VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(uuidv4(), accountId, encAccess, encRefresh, tokens.expiresAt, tokens.scope);
+        [uuidv4(), accountId, encAccess, encRefresh, tokens.expiresAt, tokens.scope],
+      );
     }
 
     console.log(`[accounts] Connected Gmail account: ${gmailEmail} for user ${userId}`);
+
+    // Trigger Gmail users.watch registration in background
+    setupWatchForAccount(accountId).catch((wErr) => {
+      console.warn('[accounts] Watch setup attempt completed with result:', wErr);
+    });
+
     await new Promise<void>((resolve) => {
       req.session.save(() => resolve());
     });
@@ -219,20 +236,20 @@ accountsRouter.delete('/:accountId', requireAuth, async (req: Request, res: Resp
   const accountId = String(req.params['accountId']);
   const db = getDb();
 
-  const account = db
-    .prepare(
-      'SELECT id FROM connected_google_accounts WHERE id = ? AND user_id = ?',
-    )
-    .get(accountId, userId) as { id: string } | undefined;
+  const account = await db.queryOne<{ id: string }>(
+    'SELECT id FROM connected_google_accounts WHERE id = ? AND user_id = ?',
+    [accountId, userId],
+  );
 
   if (!account) {
     return res.status(404).json({ error: 'Account not found.' });
   }
 
   try {
-    const cred = db
-      .prepare('SELECT access_token_enc FROM gmail_credentials WHERE connected_account_id = ?')
-      .get(accountId) as { access_token_enc: string } | undefined;
+    const cred = await db.queryOne<{ access_token_enc: string }>(
+      'SELECT access_token_enc FROM gmail_credentials WHERE connected_account_id = ?',
+      [accountId],
+    );
 
     if (cred) {
       const accessToken = decrypt(cred.access_token_enc);
@@ -244,7 +261,7 @@ accountsRouter.delete('/:accountId', requireAuth, async (req: Request, res: Resp
     console.warn('[accounts] Token revoke failed (non-fatal):', e);
   }
 
-  db.prepare('DELETE FROM connected_google_accounts WHERE id = ?').run(accountId);
+  await db.execute('DELETE FROM connected_google_accounts WHERE id = ?', [accountId]);
 
   console.log(`[accounts] Disconnected account ${accountId} for user ${userId}`);
   res.json({ ok: true });

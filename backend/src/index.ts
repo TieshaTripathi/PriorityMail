@@ -2,12 +2,17 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
+import connectPgSimple from 'connect-pg-simple';
 
-import { getDb } from './db/database.js';
+import { initDb, getPgPool } from './db/database.js';
 import { classifyRouter } from './routes/classify.js';
 import { authRouter } from './routes/auth.js';
 import { accountsRouter } from './routes/accounts.js';
 import { gmailRouter } from './routes/gmail.js';
+import { notificationsRouter } from './routes/notifications.js';
+import { webhooksRouter } from './routes/webhooks.js';
+import { settingsRouter } from './routes/settings.js';
+import { startBackgroundJobs } from './services/scheduler.js';
 
 // ----------------------------------------------------------------
 // Validate required secrets on startup
@@ -17,9 +22,6 @@ if (!process.env.SESSION_SECRET && process.env.NODE_ENV === 'production') {
   console.error('[startup] SESSION_SECRET must be set in production.');
   process.exit(1);
 }
-
-// Initialize DB (runs migrations)
-getDb();
 
 const app = express();
 
@@ -53,7 +55,7 @@ const allowedOrigins = Array.from(
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow requests with no origin (curl, Postman, mobile apps)
+      // Allow requests with no origin (curl, Postman, mobile apps, PubSub)
       if (!origin) return cb(null, true);
       const normalized = origin.replace(/\/+$/, '');
       if (allowedOrigins.includes(normalized)) {
@@ -67,54 +69,93 @@ app.use(
 
 app.use(express.json());
 
-// ----------------------------------------------------------------
-// Sessions
-// In production across domains (e.g. Vercel frontend + Render backend),
-// cookies must have SameSite=None and Secure=true over HTTPS.
-// In local development on localhost, SameSite=Lax and Secure=false.
-// ----------------------------------------------------------------
-app.use(
-  session({
-    secret: SESSION_SECRET,
-    name: 'pm.sid',
-    resave: false,
-    saveUninitialized: false,
-    proxy: isProduction,
-    cookie: {
-      httpOnly: true,
-      sameSite: isProduction ? 'none' : 'lax',
-      secure: isProduction,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    },
-  }),
-);
+// Main bootstrap function
+async function bootstrap() {
+  // 1. Initialize database and apply migrations
+  await initDb();
 
-// ----------------------------------------------------------------
-// Health Check Endpoints (safe, does not expose secrets)
-// ----------------------------------------------------------------
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok' });
+  // 2. Configure sessions (PostgreSQL connect-pg-simple in production, MemoryStore in local dev)
+  const pgPool = getPgPool();
+  let sessionStore: session.Store | undefined;
+
+  if (pgPool) {
+    const PgSession = connectPgSimple(session);
+    sessionStore = new PgSession({
+      pool: pgPool,
+      createTableIfMissing: true,
+    });
+    console.log('[session] Using PostgreSQL persistent session store.');
+  } else {
+    console.log('[session] Using local session store (set DATABASE_URL for PostgreSQL persistence).');
+  }
+
+  app.use(
+    session({
+      store: sessionStore,
+      secret: SESSION_SECRET,
+      name: 'pm.sid',
+      resave: false,
+      saveUninitialized: false,
+      proxy: isProduction,
+      cookie: {
+        httpOnly: true,
+        sameSite: isProduction ? 'none' : 'lax',
+        secure: isProduction,
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      },
+    }),
+  );
+
+  // ----------------------------------------------------------------
+  // Health Check Endpoints
+  // ----------------------------------------------------------------
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'priority-mail-backend',
+      version: '2.0.0',
+      database: pgPool ? 'postgresql' : 'sqlite',
+    });
+  });
+
+  app.get('/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'priority-mail-backend',
+      version: '2.0.0',
+      database: pgPool ? 'postgresql' : 'sqlite',
+    });
+  });
+
+  // ----------------------------------------------------------------
+  // Routes
+  // ----------------------------------------------------------------
+  app.use('/api/auth', authRouter);
+  app.use('/api/accounts', accountsRouter);
+  app.use('/api/gmail', gmailRouter);
+  app.use('/api/emails', gmailRouter); // Mobile app compatibility
+  app.use('/api/notifications', notificationsRouter);
+  app.use('/api/webhooks', webhooksRouter);
+  app.use('/api/settings', settingsRouter);
+  app.use('/api/classify', classifyRouter); // Legacy — kept for backward compat
+
+  // ----------------------------------------------------------------
+  // Background jobs
+  // ----------------------------------------------------------------
+  startBackgroundJobs();
+
+  // ----------------------------------------------------------------
+  // Start server
+  // ----------------------------------------------------------------
+  const port = Number(process.env.PORT || 4000);
+  const host = process.env.HOST || '0.0.0.0';
+
+  app.listen(port, host, () => {
+    console.log(`PriorityMail API running on http://${host}:${port}`);
+  });
+}
+
+bootstrap().catch((err) => {
+  console.error('[bootstrap] Fatal startup error:', err);
+  process.exit(1);
 });
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
-});
-
-// ----------------------------------------------------------------
-// Routes
-// ----------------------------------------------------------------
-app.use('/api/auth', authRouter);
-app.use('/api/accounts', accountsRouter);
-app.use('/api/gmail', gmailRouter);
-app.use('/api/emails', gmailRouter); // Mobile app compatibility
-app.use('/api/classify', classifyRouter); // Legacy — kept for backward compat
-
-// ----------------------------------------------------------------
-// Start
-const port = Number(process.env.PORT || 4000);
-const host = process.env.HOST || '0.0.0.0';
-
-app.listen(port, host, () => {
-  console.log(`PriorityMail API running on http://${host}:${port}`);
-});
-

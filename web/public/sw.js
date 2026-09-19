@@ -32,21 +32,34 @@ self.addEventListener('push', (event) => {
   } catch {
     // Privacy-preserving default
   }
-  const emailId = typeof payload.emailId === 'string' ? payload.emailId : '';
-  event.waitUntil(
-    self.registration.showNotification('PriorityMail', {
-      body: payload.body || 'You have an email that needs attention.',
-      icon: '/icons/icon-192.png',
-      tag: emailId || 'prioritymail',
-      data: { url: emailId ? '/#email/' + encodeURIComponent(emailId) : '/' },
-    })
-  );
+
+  const title = payload.title || 'PriorityMail';
+  const sender = payload.senderName || 'Important Message';
+  const subject = payload.subject || 'Action required';
+  const reason = payload.reason ? `\nReason: ${payload.reason}` : '';
+  const body = payload.body || `${sender}\n${subject}${reason}`;
+  const emailId = payload.internalEmailId || payload.gmailMessageId || '';
+
+  const options = {
+    body,
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    tag: emailId || 'prioritymail',
+    data: {
+      url: emailId ? '/#email/' + encodeURIComponent(emailId) : '/',
+      ...payload,
+    },
+  };
+
+  event.waitUntil(self.registration.showNotification(title, options));
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const candidate = new URL(event.notification.data?.url || '/', self.location.origin);
+  const targetUrl = event.notification.data?.url || '/';
+  const candidate = new URL(targetUrl, self.location.origin);
   const url = candidate.origin === self.location.origin ? candidate.href : self.location.origin;
+
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async (clients) => {
       const client = clients.find((c) => new URL(c.url).origin === self.location.origin);

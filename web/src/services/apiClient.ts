@@ -1,41 +1,135 @@
 // PriorityMail Web — Typed API Client
-// All requests go to the backend. No secrets live in the frontend bundle.
-// Credentials (session cookies) are sent automatically by the browser.
+// Connects to Supabase Edge Functions with authenticated Supabase JWT Bearer tokens.
+// Falls back to legacy API during transitional migration testing.
 
-import { getApiBaseUrl } from './apiUrl';
+import { supabase, isSupabaseConfigured, getSupabaseFunctionsUrl } from './supabaseClient.ts';
+import { getApiBaseUrl } from './apiUrl.ts';
+
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+/**
+ * Maps legacy /api/* endpoints to Supabase Edge Function endpoints.
+ */
+function resolveEdgeFunctionUrl(path: string): { url: string; methodOverride?: string } {
+  const base = getSupabaseFunctionsUrl();
+
+  // /api/accounts
+  if (path === '/api/accounts' || path === '/api/accounts/connected') {
+    return { url: `${base}/gmail-accounts` };
+  }
+  if (path.startsWith('/api/accounts/')) {
+    const parts = path.split('/');
+    const accountId = parts[3];
+    if (accountId === 'connect' || accountId === 'google') {
+      return { url: `${base}/gmail-connect` };
+    }
+    return { url: `${base}/gmail-accounts?accountId=${encodeURIComponent(accountId)}` };
+  }
+
+  // /api/gmail
+  if (path.startsWith('/api/gmail')) {
+    if (path === '/api/gmail/messages' || path === '/api/emails/priority') {
+      return { url: `${base}/gmail-messages` };
+    }
+    if (path === '/api/gmail/sync') {
+      return { url: `${base}/gmail-sync` };
+    }
+
+    const matchAccountMessages = path.match(/^\/api\/gmail\/([^/]+)\/messages(\?.*)?$/);
+    if (matchAccountMessages) {
+      const accountId = matchAccountMessages[1];
+      const query = matchAccountMessages[2] || '';
+      const sep = query ? '&' : '?';
+      return { url: `${base}/gmail-messages${query}${sep}accountId=${encodeURIComponent(accountId)}` };
+    }
+
+    const matchAccountSync = path.match(/^\/api\/gmail\/([^/]+)\/sync$/);
+    if (matchAccountSync) {
+      const accountId = matchAccountSync[1];
+      return { url: `${base}/gmail-sync?accountId=${encodeURIComponent(accountId)}` };
+    }
+
+    const matchLabels = path.match(/^\/api\/gmail\/([^/]+)\/labels$/);
+    if (matchLabels) {
+      const accountId = matchLabels[1];
+      return { url: `${base}/gmail-labels?accountId=${encodeURIComponent(accountId)}` };
+    }
+  }
+
+  // /api/notifications
+  if (path === '/api/notifications/vapid-public-key') {
+    return { url: `${base}/notifications-vapid-key` };
+  }
+  if (path === '/api/notifications/subscribe' || path === '/api/notifications/unsubscribe') {
+    return { url: `${base}/notifications-subscribe` };
+  }
+  if (path === '/api/notifications/register-device') {
+    return { url: `${base}/notifications-register-device` };
+  }
+  if (path === '/api/notifications/test') {
+    return { url: `${base}/notifications-test` };
+  }
+
+  // /api/settings
+  if (path === '/api/settings') {
+    return { url: `${base}/user-settings` };
+  }
+
+  // Default passthrough
+  return { url: `${base}${path.replace(/^\/api\//, '/')}` };
+}
 
 async function apiFetch<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  const base = getApiBaseUrl();
-  const res = await fetch(`${base}${path}`, {
-    credentials: 'include', // send session cookie cross-origin
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
+  let targetUrl: string;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options?.headers as Record<string, string>),
+  };
+
+  if (isSupabaseConfigured) {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+    const { url } = resolveEdgeFunctionUrl(path);
+    targetUrl = url;
+  } else {
+    const base = getApiBaseUrl();
+    targetUrl = `${base}${path}`;
+  }
+
+  const res = await fetch(targetUrl, {
+    credentials: isSupabaseConfigured ? 'omit' : 'include',
     ...options,
+    headers,
   });
 
   if (!res.ok) {
     let errorMessage = `API error ${res.status}`;
     try {
-      const body = await res.json() as { error?: string };
+      const body = (await res.json()) as { error?: string };
       if (body.error) errorMessage = body.error;
-    } catch { /* ignore parse errors */ }
+    } catch {
+      /* ignore parse error */
+    }
     throw new ApiError(errorMessage, res.status);
   }
 
   return res.json() as Promise<T>;
 }
 
-export class ApiError extends Error {
-  constructor(message: string, public readonly status: number) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
-
 // ----------------------------------------------------------------
-// Auth
+// Auth Types
 // ----------------------------------------------------------------
 
 export interface UserDto {
@@ -47,8 +141,24 @@ export interface UserDto {
   createdAt: string;
 }
 
-/** Fetch the current session user. Returns null if not authenticated. */
 export async function getMe(): Promise<UserDto | null> {
+  if (isSupabaseConfigured) {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return null;
+    return {
+      id: user.id,
+      googleUserId: user.user_metadata?.sub || user.id,
+      email: user.email || '',
+      displayName:
+        user.user_metadata?.full_name ||
+        user.user_metadata?.name ||
+        user.email?.split('@')[0] ||
+        'PriorityMail User',
+      avatarUrl: user.user_metadata?.avatar_url,
+      createdAt: user.created_at,
+    };
+  }
+
   try {
     return await apiFetch<UserDto>('/api/auth/me');
   } catch (e) {
@@ -57,24 +167,22 @@ export async function getMe(): Promise<UserDto | null> {
   }
 }
 
-/** Get the direct browser navigation URL for Google login. */
 export function getDirectLoginUrl(): string {
+  if (isSupabaseConfigured) {
+    return `${getSupabaseFunctionsUrl()}/gmail-connect`;
+  }
   return `${getApiBaseUrl()}/api/auth/google`;
 }
 
-/** Get the Google login URL from the backend (or fallback to direct OAuth endpoint). */
 export async function getLoginUrl(): Promise<string> {
-  try {
-    const data = await apiFetch<{ url: string }>('/api/auth/google/login');
-    if (data.url) return data.url;
-  } catch {
-    // Fall back to direct navigation if JSON endpoint is unavailable
-  }
   return getDirectLoginUrl();
 }
 
-/** Destroy the current session. */
 export async function logout(): Promise<void> {
+  if (isSupabaseConfigured) {
+    await supabase.auth.signOut();
+    return;
+  }
   await apiFetch('/api/auth/logout', { method: 'POST' });
 }
 
@@ -97,13 +205,20 @@ export async function getConnectedAccounts(): Promise<ConnectedAccountDto[]> {
   return apiFetch<ConnectedAccountDto[]>('/api/accounts');
 }
 
-/** Get the direct browser navigation URL to connect a Gmail account. */
 export function getDirectConnectGmailUrl(): string {
+  if (isSupabaseConfigured) {
+    return `${getSupabaseFunctionsUrl()}/gmail-connect`;
+  }
   return `${getApiBaseUrl()}/api/accounts/google/connect`;
 }
 
-/** Get the URL to start connecting a new Gmail account. */
 export async function startConnectGmailAccount(): Promise<string> {
+  if (isSupabaseConfigured) {
+    const data = await apiFetch<{ url: string }>('/api/accounts/connect/start', {
+      method: 'POST',
+    });
+    if (data.url) return data.url;
+  }
   try {
     const data = await apiFetch<{ url: string }>('/api/accounts/connect/start', {
       method: 'POST',
@@ -115,7 +230,6 @@ export async function startConnectGmailAccount(): Promise<string> {
   return getDirectConnectGmailUrl();
 }
 
-/** Disconnect a Gmail account. */
 export async function disconnectAccount(accountId: string): Promise<void> {
   await apiFetch(`/api/accounts/${encodeURIComponent(accountId)}`, {
     method: 'DELETE',
@@ -150,6 +264,7 @@ export interface GmailEmailDto {
   reason: string;
   reasons: string[];
   score: number;
+  deadline?: string;
 }
 
 export interface GmailMessagesResponse {
@@ -167,7 +282,6 @@ export async function fetchGmailMessages(
   );
 }
 
-/** Fetch messages across all connected Gmail accounts. */
 export async function fetchAllGmailMessages(
   max = 30,
 ): Promise<{ emails: GmailEmailDto[]; accounts: { id: string; email: string }[] }> {
@@ -176,17 +290,15 @@ export async function fetchAllGmailMessages(
   );
 }
 
-/** Trigger a manual sync for an account. */
 export async function syncGmailAccount(
   accountId: string,
-): Promise<{ success: boolean; count: number; syncedAt: string }> {
-  return apiFetch<{ success: boolean; count: number; syncedAt: string }>(
+): Promise<{ success: boolean; count: number; syncedAt: string; accountEmail?: string }> {
+  return apiFetch<{ success: boolean; count: number; syncedAt: string; accountEmail?: string }>(
     `/api/gmail/${encodeURIComponent(accountId)}/sync`,
     { method: 'POST' },
   );
 }
 
-/** Trigger a manual sync across all connected accounts. */
 export async function syncAllGmailAccounts(): Promise<{ success: boolean; count: number; syncedAt: string }> {
   return apiFetch<{ success: boolean; count: number; syncedAt: string }>(
     '/api/gmail/sync',
@@ -205,4 +317,70 @@ export async function fetchGmailLabels(accountId: string): Promise<GmailLabel[]>
     `/api/gmail/${encodeURIComponent(accountId)}/labels`,
   );
   return data.labels;
+}
+
+// ----------------------------------------------------------------
+// Notifications & Web Push
+// ----------------------------------------------------------------
+
+export async function getVapidPublicKey(): Promise<string> {
+  const data = await apiFetch<{ publicKey: string }>('/api/notifications/vapid-public-key');
+  return data.publicKey;
+}
+
+export async function subscribeWebPush(subscription: PushSubscriptionJSON): Promise<boolean> {
+  const res = await apiFetch<{ ok: boolean }>('/api/notifications/subscribe', {
+    method: 'POST',
+    body: JSON.stringify({
+      endpoint: subscription.endpoint,
+      keys: subscription.keys,
+      userAgent: navigator.userAgent,
+    }),
+  });
+  return res.ok;
+}
+
+export async function unsubscribeWebPush(endpoint: string): Promise<boolean> {
+  const res = await apiFetch<{ ok: boolean }>('/api/notifications/unsubscribe', {
+    method: 'DELETE',
+    body: JSON.stringify({ endpoint }),
+  });
+  return res.ok;
+}
+
+export async function sendTestNotificationApi(): Promise<{
+  success: boolean;
+  pwaSent: number;
+  mobileSent: number;
+  totalDevices: number;
+  message: string;
+}> {
+  return apiFetch('/api/notifications/test', { method: 'POST' });
+}
+
+// ----------------------------------------------------------------
+// Settings
+// ----------------------------------------------------------------
+
+export interface UserSettingsDto {
+  notifications: boolean;
+  vipAlerts: boolean;
+  deadlineAlerts: boolean;
+  actionAlerts: boolean;
+  sensitivity: 'Low' | 'Balanced' | 'High';
+  quietHours: boolean;
+  quietStart: string;
+  quietEnd: string;
+}
+
+export async function getUserSettings(): Promise<UserSettingsDto> {
+  return apiFetch<UserSettingsDto>('/api/settings');
+}
+
+export async function updateUserSettings(settings: Partial<UserSettingsDto>): Promise<boolean> {
+  const res = await apiFetch<{ ok: boolean }>('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+  return res.ok;
 }

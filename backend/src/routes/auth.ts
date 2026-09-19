@@ -62,20 +62,30 @@ authRouter.get('/google/callback', async (req: Request, res: Response) => {
     const profile = await verifyIdToken(tokens.idToken);
     const db = getDb();
 
-    let user = db
-      .prepare('SELECT * FROM users WHERE google_user_id = ?')
-      .get(profile.sub) as { id: string; email: string; display_name: string; avatar_url: string | null } | undefined;
+    let user = await db.queryOne<{
+      id: string;
+      email: string;
+      display_name: string;
+      avatar_url: string | null;
+    }>('SELECT * FROM users WHERE google_user_id = ?', [profile.sub]);
 
     if (!user) {
       const newId = uuidv4();
-      db.prepare(
+      await db.execute(
         'INSERT INTO users (id, google_user_id, email, display_name, avatar_url) VALUES (?, ?, ?, ?, ?)',
-      ).run(newId, profile.sub, profile.email, profile.name, profile.picture ?? null);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(newId) as typeof user;
+        [newId, profile.sub, profile.email, profile.name, profile.picture ?? null],
+      );
+      user = await db.queryOne<{
+        id: string;
+        email: string;
+        display_name: string;
+        avatar_url: string | null;
+      }>('SELECT * FROM users WHERE id = ?', [newId]);
     } else {
-      db.prepare(
+      await db.execute(
         'UPDATE users SET email = ?, display_name = ?, avatar_url = ? WHERE google_user_id = ?',
-      ).run(profile.email, profile.name, profile.picture ?? null, profile.sub);
+        [profile.email, profile.name, profile.picture ?? null, profile.sub],
+      );
     }
 
     if (!user) throw new Error('Failed to create or find user.');
@@ -104,22 +114,23 @@ authRouter.post('/logout', (req: Request, res: Response) => {
   });
 });
 
-authRouter.get('/me', (req: Request, res: Response) => {
+authRouter.get('/me', async (req: Request, res: Response) => {
   if (!req.session.userId) {
     return res.status(401).json({ error: 'Not authenticated.' });
   }
 
   const db = getDb();
-  const user = db
-    .prepare('SELECT id, google_user_id, email, display_name, avatar_url, created_at FROM users WHERE id = ?')
-    .get(req.session.userId) as {
-      id: string;
-      google_user_id: string;
-      email: string;
-      display_name: string;
-      avatar_url: string | null;
-      created_at: string;
-    } | undefined;
+  const user = await db.queryOne<{
+    id: string;
+    google_user_id: string;
+    email: string;
+    display_name: string;
+    avatar_url: string | null;
+    created_at: string;
+  }>(
+    'SELECT id, google_user_id, email, display_name, avatar_url, created_at FROM users WHERE id = ?',
+    [req.session.userId],
+  );
 
   if (!user) {
     req.session.destroy(() => {});

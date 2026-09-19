@@ -2,6 +2,7 @@ import { openEmailInGmail } from './gmailDeepLink';
 import * as Linking from 'expo-linking';
 import { PriorityEmail } from '../types';
 import { initialMockEmails } from './mockData';
+import { supabase, isSupabaseConfigured, getSupabaseFunctionsUrl } from './supabaseClient';
 
 export interface GmailAuthResult {
   success: boolean;
@@ -18,31 +19,40 @@ export interface GmailWatchStatus {
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'https://priority-mail-zeta.vercel.app';
 
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (isSupabaseConfigured) {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+  }
+  return headers;
+}
+
 /**
  * Service handling Gmail API operations and deep-linking into the Gmail app or web client.
  */
 export const GmailService = {
   /**
    * Connect user's Google Account via OAuth.
-   * In local/offline mode, simulates a successful OAuth connection.
    */
   async connectGoogleAccount(): Promise<GmailAuthResult> {
     try {
-      const isLiveEnabled = process.env.EXPO_PUBLIC_ENABLE_LIVE_SYNC === 'true';
-
-      if (isLiveEnabled) {
-        // Direct browser / in-app browser redirect to backend Google OAuth
-        await Linking.openURL(`${API_BASE_URL}/api/auth/google`);
-        return { success: true };
+      if (isSupabaseConfigured) {
+        const functionsUrl = getSupabaseFunctionsUrl();
+        const headers = await getAuthHeaders();
+        const res = await fetch(`${functionsUrl}/gmail-connect`, { headers });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.url) {
+            await Linking.openURL(data.url);
+            return { success: true };
+          }
+        }
       }
-
-      // Default mock flow: simulate successful authorization
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      return {
-        success: true,
-        email: 'tiesha.work@gmail.com',
-        token: 'mock-oauth-bearer-token-2026',
-      };
+      await Linking.openURL(`${API_BASE_URL}/api/accounts/google/connect`);
+      return { success: true };
     } catch (error) {
       return {
         success: false,
@@ -54,31 +64,87 @@ export const GmailService = {
   /**
    * Disconnect the currently linked Google Account.
    */
-  async disconnectGoogleAccount(): Promise<boolean> {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return true;
+  async disconnectGoogleAccount(accountId?: string): Promise<boolean> {
+    try {
+      if (!accountId) return true;
+      const headers = await getAuthHeaders();
+      if (isSupabaseConfigured) {
+        const functionsUrl = getSupabaseFunctionsUrl();
+        const res = await fetch(`${functionsUrl}/gmail-accounts?accountId=${encodeURIComponent(accountId)}`, {
+          method: 'DELETE',
+          headers,
+        });
+        return res.ok;
+      }
+      await fetch(`${API_BASE_URL}/api/accounts/${encodeURIComponent(accountId)}`, {
+        method: 'DELETE',
+        headers,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   },
 
   /**
-   * Fetch recent emails from Gmail (or local dataset).
+   * Fetch recent emails from real Gmail via PriorityMail backend.
    */
   async fetchRecentEmails(): Promise<PriorityEmail[]> {
-    const isLiveEnabled = process.env.EXPO_PUBLIC_ENABLE_LIVE_SYNC === 'true';
-
-    if (isLiveEnabled) {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/emails/priority`);
+    try {
+      const headers = await getAuthHeaders();
+      if (isSupabaseConfigured) {
+        const functionsUrl = getSupabaseFunctionsUrl();
+        const response = await fetch(`${functionsUrl}/gmail-messages`, { headers });
         if (response.ok) {
           const data = await response.json();
-          return data.emails || [];
+          if (Array.isArray(data.emails)) {
+            return data.emails;
+          }
         }
-      } catch (err) {
-        console.warn('Backend unavailable, falling back to local mock data:', err);
+      } else {
+        const response = await fetch(`${API_BASE_URL}/api/emails/priority`, { headers });
+        if (response.ok) {
+          const data = await response.json();
+          if (Array.isArray(data.emails)) {
+            return data.emails;
+          }
+        }
       }
+    } catch (err) {
+      console.warn('[mobile] Live fetch unavailable:', err);
     }
 
-    // Return fresh mock data
     return [...initialMockEmails];
+  },
+
+  /**
+   * Register mobile device push token with PriorityMail backend.
+   */
+  async registerDeviceToken(
+    token: string,
+    platform: 'android' | 'ios' = 'android',
+    deviceName?: string
+  ): Promise<boolean> {
+    try {
+      const headers = await getAuthHeaders();
+      if (isSupabaseConfigured) {
+        const functionsUrl = getSupabaseFunctionsUrl();
+        const response = await fetch(`${functionsUrl}/notifications-register-device`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ token, platform, deviceName }),
+        });
+        return response.ok;
+      }
+      const response = await fetch(`${API_BASE_URL}/api/notifications/register-device`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ token, platform, deviceName }),
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
   },
 
   /**
@@ -95,7 +161,7 @@ export const GmailService = {
    * Start Gmail push notifications watch via Google Cloud Pub/Sub.
    */
   async startGmailWatch(topicName?: string): Promise<GmailWatchStatus> {
-    console.log(`Setting up Gmail watch on PubSub topic: ${topicName || 'priority-mail-sub'}`);
+    console.log(`Setting up Gmail watch on PubSub topic: ${topicName || 'priority-mail-watch'}`);
     return {
       active: true,
       historyId: '892401',

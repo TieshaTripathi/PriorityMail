@@ -23,48 +23,99 @@ personal-email-priority-assistant/
 ## Google Cloud Setup (Required)
 
 ### 1. Create a Google Cloud Project
-
 1. Go to [console.cloud.google.com](https://console.cloud.google.com/)
-2. Create a new project (e.g. `prioritymail-dev`)
+2. Create a new project (e.g. `prioritymail-prod`)
 
 ### 2. Enable APIs
-
 In your project, enable:
-- **Gmail API** — [Enable it here](https://console.cloud.google.com/apis/library/gmail.googleapis.com)
-- **Google People API** (optional, for richer profiles)
+- **Gmail API** — [Enable here](https://console.cloud.google.com/apis/library/gmail.googleapis.com)
+- **Cloud Pub/Sub API** (for real-time email push notifications) — [Enable here](https://console.cloud.google.com/apis/library/pubsub.googleapis.com)
 
-### 3. Configure OAuth Consent Screen
-
+### 3. Configure OAuth Consent Screen & Fix 403 access_denied
+If you see `403 access_denied: "app has not completed Google verification"`, your app is in "Testing" mode and the target Gmail address must be added to Test Users:
 1. Go to **APIs & Services → OAuth consent screen**
-2. Select **External** (for personal/testing use)
-3. Fill in:
-   - App name: `PriorityMail`
-   - User support email: your email
-   - Developer contact: your email
-4. Add scopes:
+2. User type: **External**
+3. Add scopes:
    - `openid`
    - `email`
    - `profile`
    - `https://www.googleapis.com/auth/gmail.readonly`
    - `https://www.googleapis.com/auth/gmail.labels`
-5. Add test users: add your own Gmail addresses
-6. Save and continue
+4. Under **Test users**, click **+ Add users**:
+   - Enter your login email AND any additional Gmail account you want to connect.
+   - Click **Save**. (Only added test users can authorize while the app is unverified).
 
 ### 4. Create OAuth 2.0 Credentials
-
 1. Go to **APIs & Services → Credentials**
-2. Click **Create Credentials → OAuth client ID**
-3. Application type: **Web application**
-4. Name: `PriorityMail Local`
-5. **Authorized redirect URIs** — add ALL of these exactly:
+2. Click **Create Credentials → OAuth client ID** (Application type: **Web application**)
+3. Authorized redirect URIs:
    ```
+   # Local Development:
    http://localhost:4000/api/auth/google/callback
-   http://localhost:4000/api/accounts/connect/callback
-   ```
-6. Click Create
-7. Copy the **Client ID** and **Client Secret**
+   http://localhost:4000/api/accounts/google/callback
 
-> ⚠️ The Client Secret must NEVER be in frontend code or committed to git.
+   # Production (Same-Origin Vercel Proxy):
+   https://priority-mail-zeta.vercel.app/api/auth/google/callback
+   https://priority-mail-zeta.vercel.app/api/accounts/google/callback
+   ```
+4. Copy `Client ID` and `Client Secret` to your backend environment (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`).
+
+---
+
+## Real-Time Gmail Watch & Google Cloud Pub/Sub Setup
+
+To automatically detect incoming emails in real-time without polling:
+
+### 1. Create Pub/Sub Topic
+1. Go to [Google Cloud Pub/Sub Topics](https://console.cloud.google.com/cloudpubsub/topic/list).
+2. Click **Create Topic**.
+3. Topic ID: `priority-mail-watch` (full topic path will look like `projects/<your-project-id>/topics/priority-mail-watch`).
+4. Click **Create**.
+
+### 2. Grant Gmail Publisher Permission on the Topic
+Google's Gmail push system requires permission to publish messages to your topic:
+1. Open your new `priority-mail-watch` topic.
+2. Go to the **Permissions** tab on the right side.
+3. Click **Add Principal**.
+4. In **New principals**, enter:
+   ```
+   serviceAccount:gmail-api-push@system.gserviceaccount.com
+   ```
+5. Select Role: **Pub/Sub Publisher** (`roles/pubsub.publisher`).
+6. Click **Save**.
+
+### 3. Create Pub/Sub Push Subscription (Webhook Delivery)
+1. In your `priority-mail-watch` topic, click **Create Subscription**.
+2. Subscription ID: `priority-mail-push-sub`.
+3. Delivery type: Select **Push**.
+4. Endpoint URL:
+   ```
+   https://priority-mail-zeta.vercel.app/api/webhooks/gmail-pubsub
+   ```
+   *(Or direct Render backend: `https://prioritymail-ovda.onrender.com/api/webhooks/gmail-pubsub`)*
+5. Set **Acknowledgment deadline** to `30` seconds.
+6. Click **Create**.
+
+### 4. Add Environment Variable
+In your Render backend dashboard:
+```env
+PUBSUB_TOPIC_NAME=projects/<your-project-id>/topics/priority-mail-watch
+```
+PriorityMail will automatically call `users.watch` when Gmail accounts connect and renew them daily via its background scheduler.
+
+---
+
+## Persistent Database (PostgreSQL)
+
+Render free instances have ephemeral storage (SQLite resets if the server restarts). PriorityMail supports seamless PostgreSQL persistence:
+
+1. Provision a free managed PostgreSQL instance (e.g., [Render PostgreSQL](https://render.com/docs/databases), [Neon](https://neon.tech), or [Supabase](https://supabase.com)).
+2. Copy the connection string (format: `postgres://user:password@host:port/dbname?sslmode=require`).
+3. Set in Render Environment:
+   ```env
+   DATABASE_URL=postgres://user:password@host:port/dbname?sslmode=require
+   ```
+4. PriorityMail automatically connects via `pg.Pool`, creates all tables, and uses persistent `connect-pg-simple` session storage. SQLite is used automatically as fallback when `DATABASE_URL` is omitted.
 
 ---
 

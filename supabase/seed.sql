@@ -1,0 +1,2 @@
+-- Seed file for PriorityMail (local development)
+-- Real users will be created through Supabase Auth.

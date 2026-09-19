@@ -1,9 +1,21 @@
+import { useState } from 'react';
 import { useAuth } from '../services/authContext';
 import { Icon } from '../components/Icon';
+import { PrivacyPolicyPage } from './PrivacyPolicyPage';
+import { TermsPage } from './TermsPage';
 
 export function LoginPage() {
   const { login, auth, errorMessage, serverReachable } = useAuth();
+  const [view, setView] = useState<'login' | 'privacy' | 'terms'>('login');
   const isLoading = auth.status === 'loading';
+
+  if (view === 'privacy') {
+    return <PrivacyPolicyPage onBack={() => setView('login')} />;
+  }
+
+  if (view === 'terms') {
+    return <TermsPage onBack={() => setView('login')} />;
+  }
 
   const displayError =
     errorMessage ||
@@ -80,6 +92,24 @@ export function LoginPage() {
           PriorityMail requests read-only access — we never send, delete,
           or modify your emails.
         </p>
+
+        <div style={{ marginTop: 14, display: 'flex', gap: 12, justifyContent: 'center', fontSize: '11px' }}>
+          <button
+            type="button"
+            onClick={() => setView('privacy')}
+            style={{ background: 'none', border: 'none', color: '#6B7280', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
+          >
+            Privacy Policy
+          </button>
+          <span style={{ color: '#D1D5DB' }}>·</span>
+          <button
+            type="button"
+            onClick={() => setView('terms')}
+            style={{ background: 'none', border: 'none', color: '#6B7280', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
+          >
+            Terms of Service
+          </button>
+        </div>
       </div>
 
       {/* Decorative gradient orbs */}

@@ -5,10 +5,17 @@ import { Modal } from './components/Modal';
 import { defaultMockRules, defaultVipPeople, initialMockEmails } from './services/mockData';
 import { useStored } from './services/storage';
 import { gmailWebUrl, openEmailInGmail } from './services/gmailDeepLink';
-import { mockNotification, requestNotificationPermission, type NotificationPreferences } from './services/notifications';
+import {
+  enablePushNotifications,
+  triggerTestPush,
+  getExistingPushSubscription,
+  type NotificationPreferences,
+} from './services/notifications';
 import type { PriorityRule, PriorityRuleType, VipPerson, PrioritySensitivity, PriorityEmail } from './types';
 import { AuthProvider, useAuth } from './services/authContext';
 import { LoginPage } from './pages/LoginPage';
+import { PrivacyPolicyPage } from './pages/PrivacyPolicyPage';
+import { TermsPage } from './pages/TermsPage';
 import { ConnectedAccountsList } from './components/ConnectedAccountsList';
 import {
   getConnectedAccounts,
@@ -17,6 +24,8 @@ import {
   syncGmailAccount,
   syncAllGmailAccounts,
   startConnectGmailAccount,
+  getUserSettings,
+  updateUserSettings,
   type ConnectedAccountDto,
   type GmailEmailDto,
 } from './services/apiClient';
@@ -195,20 +204,22 @@ function AppInner() {
   const [account, setAccount] = useState('all');
   const [status, setStatus] = useState('all');
   const [toast, setToast] = useState('');
-  const [modal, setModal] = useState<'rule' | 'person' | 'install' | 'reset' | null>(null);
+  const [modal, setModal] = useState<'rule' | 'person' | 'install' | 'reset' | 'privacy' | 'terms' | null>(null);
   const [snoozeId, setSnoozeId] = useState('');
   const [online, setOnline] = useState(navigator.onLine);
   const [updateReady, setUpdateReady] = useState(false);
   const [offlineError, setOfflineError] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<(Event & { prompt: () => Promise<void> }) | null>(null);
 
-  // Real Gmail accounts and messages from backend
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccountDto[]>([]);
   const [gmailEmails, setGmailEmails] = useState<GmailEmailDto[]>([]);
   const [gmailLoading, setGmailLoading] = useState(false);
   const [gmailSyncing, setGmailSyncing] = useState(false);
   const [gmailError, setGmailError] = useState('');
   const [connectingGoogle, setConnectingGoogle] = useState(false);
+  const [pushActive, setPushActive] = useState(false);
+  const [testingPush, setTestingPush] = useState(false);
+  const [enablingPush, setEnablingPush] = useState(false);
 
   const tab = location.tab;
 
@@ -267,7 +278,7 @@ function AppInner() {
     }
   };
 
-  // Load connected accounts on mount
+  // Load connected accounts and push/settings state on mount
   useEffect(() => {
     getConnectedAccounts()
       .then(accounts => {
@@ -279,6 +290,28 @@ function AppInner() {
       .catch(err => {
         console.warn('[App] getConnectedAccounts error:', err);
       });
+
+    getExistingPushSubscription()
+      .then(sub => setPushActive(Boolean(sub)))
+      .catch(() => {});
+
+    getUserSettings()
+      .then(serverSettings => {
+        if (serverSettings) {
+          setSettings(prev => ({
+            ...prev,
+            notifications: serverSettings.notifications,
+            vipAlerts: serverSettings.vipAlerts,
+            deadlineAlerts: serverSettings.deadlineAlerts,
+            actionAlerts: serverSettings.actionAlerts,
+            sensitivity: serverSettings.sensitivity,
+            quietHours: serverSettings.quietHours,
+            quietStart: serverSettings.quietStart,
+            quietEnd: serverSettings.quietEnd,
+          }));
+        }
+      })
+      .catch(() => {});
   }, []);
 
   // Handle ?connect_success=1 or error from Gmail OAuth callback
@@ -487,8 +520,12 @@ function AppInner() {
     setToast('VIP added. Their messages will always stand out.');
   };
 
-  const setting = <K extends keyof Settings>(key: K, value: Settings[K]) =>
+  const setting = <K extends keyof Settings>(key: K, value: Settings[K]) => {
     setSettings(s => ({ ...s, [key]: value }));
+    updateUserSettings({ [key]: value } as any).catch(err =>
+      console.warn('[App] updateUserSettings error:', err),
+    );
+  };
 
   const storageError = rulesError || peopleError || settingsError || doneError || readError || snoozeError;
   const greeting =
@@ -1015,11 +1052,69 @@ function AppInner() {
                 checked={settings.vipAlerts}
                 onChange={v => setting('vipAlerts', v)}
               />
-              <button
-                className="text-button blue full"
-                onClick={async () => setToast(await requestNotificationPermission())}
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '10px 0',
+                  borderTop: '1px solid #f0f3f8',
+                  borderBottom: '1px solid #f0f3f8',
+                  margin: '8px 0 12px',
+                }}
               >
-                Enable browser notifications
+                <div>
+                  <strong style={{ fontSize: 13, display: 'block' }}>Push delivery</strong>
+                  <small style={{ color: '#687796' }}>Standards-based Web Push (iPhone PWA / Web)</small>
+                </div>
+                <span
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: '3px 8px',
+                    borderRadius: 6,
+                    background: pushActive ? '#dcfce7' : '#f3f4f6',
+                    color: pushActive ? '#15803d' : '#6b7280',
+                  }}
+                >
+                  {pushActive ? 'ACTIVE' : 'NOT ENABLED'}
+                </span>
+              </div>
+
+              <button
+                type="button"
+                className="primary full"
+                disabled={enablingPush}
+                onClick={async () => {
+                  setEnablingPush(true);
+                  const res = await enablePushNotifications();
+                  setEnablingPush(false);
+                  setToast(res.message);
+                  const sub = await getExistingPushSubscription();
+                  setPushActive(Boolean(sub));
+                }}
+              >
+                {enablingPush
+                  ? 'Enabling push…'
+                  : pushActive
+                    ? 'Re-enable / Update Push Subscription'
+                    : 'Enable Push Notifications'}
+              </button>
+
+              <button
+                type="button"
+                className="text-button blue full"
+                style={{ marginTop: 6 }}
+                disabled={testingPush}
+                onClick={async () => {
+                  setTestingPush(true);
+                  const res = await triggerTestPush();
+                  setTestingPush(false);
+                  setToast(res.message);
+                }}
+              >
+                {testingPush ? 'Sending test notification…' : 'Send Test Notification'}
               </button>
             </section>
 
@@ -1104,6 +1199,25 @@ function AppInner() {
               <button className="text-button danger full" onClick={() => setModal('reset')}>
                 Reset local preferences
               </button>
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #f0f3f8', display: 'flex', gap: 12, justifyContent: 'center' }}>
+                <button
+                  type="button"
+                  className="text-button blue"
+                  style={{ fontSize: '12px' }}
+                  onClick={() => setModal('privacy')}
+                >
+                  Privacy Policy
+                </button>
+                <span style={{ color: '#D1D5DB' }}>·</span>
+                <button
+                  type="button"
+                  className="text-button blue"
+                  style={{ fontSize: '12px' }}
+                  onClick={() => setModal('terms')}
+                >
+                  Terms of Service
+                </button>
+              </div>
             </section>
             <p className="demo-caption">PRIORITYMAIL · REAL GMAIL INTEGRATION</p>
           </>
@@ -1363,6 +1477,18 @@ function AppInner() {
           <button className="text-button full" onClick={() => setModal(null)}>
             Keep my data
           </button>
+        </Modal>
+      )}
+
+      {modal === 'privacy' && (
+        <Modal title="Privacy Policy" onClose={() => setModal(null)}>
+          <PrivacyPolicyPage />
+        </Modal>
+      )}
+
+      {modal === 'terms' && (
+        <Modal title="Terms of Service" onClose={() => setModal(null)}>
+          <TermsPage />
         </Modal>
       )}
     </div>
