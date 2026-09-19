@@ -5,7 +5,7 @@ import { PrivacyPolicyPage } from './PrivacyPolicyPage';
 import { TermsPage } from './TermsPage';
 
 export function LoginPage() {
-  const { login, auth, errorMessage, serverReachable } = useAuth();
+  const { login, auth, errorMessage } = useAuth();
   const [view, setView] = useState<'login' | 'privacy' | 'terms'>('login');
   const isLoading = auth.status === 'loading';
 
@@ -17,11 +17,7 @@ export function LoginPage() {
     return <TermsPage onBack={() => setView('login')} />;
   }
 
-  const displayError =
-    errorMessage ||
-    (!serverReachable
-      ? 'Could not connect to PriorityMail server. Please ensure the backend is running.'
-      : null);
+  const displayError = errorMessage;
 
   return (
     <div className="login-page">

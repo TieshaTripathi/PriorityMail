@@ -3,25 +3,32 @@
 
 import { createClient } from '@supabase/supabase-js';
 
-const getEnvVar = (name: string): string | undefined => {
-  if (typeof import.meta !== 'undefined' && import.meta.env) {
-    return import.meta.env[name] as string | undefined;
-  }
-  const proc = (globalThis as unknown as { process?: { env?: Record<string, string> } }).process;
-  if (proc?.env) {
-    return proc.env[name];
-  }
-  return undefined;
-};
+// Static references so Vite replaces them at build time
+const envSupabaseUrl =
+  typeof import.meta !== 'undefined' && import.meta.env
+    ? (import.meta.env.VITE_SUPABASE_URL as string | undefined)
+    : undefined;
+const envSupabaseAnonKey =
+  typeof import.meta !== 'undefined' && import.meta.env
+    ? (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)
+    : undefined;
 
-const rawSupabaseUrl = getEnvVar('VITE_SUPABASE_URL');
-const rawSupabaseAnonKey = getEnvVar('VITE_SUPABASE_ANON_KEY');
+// Fallback for Node/test environments
+const proc = (globalThis as unknown as { process?: { env?: Record<string, string> } }).process;
+const nodeSupabaseUrl = proc?.env?.VITE_SUPABASE_URL;
+const nodeSupabaseAnonKey = proc?.env?.VITE_SUPABASE_ANON_KEY;
 
-export const isSupabaseConfigured = Boolean(rawSupabaseUrl && rawSupabaseAnonKey);
+// Production project fallback for PriorityMail Supabase project
+const defaultSupabaseUrl = 'https://hcakoyjungekkjoowovx.supabase.co';
 
-const supabaseUrl = rawSupabaseUrl?.trim() || 'https://placeholder-project.supabase.co';
+const rawSupabaseUrl = (envSupabaseUrl || nodeSupabaseUrl || defaultSupabaseUrl).trim();
+const rawSupabaseAnonKey = (envSupabaseAnonKey || nodeSupabaseAnonKey)?.trim();
+
+export const isSupabaseConfigured = Boolean(rawSupabaseAnonKey && rawSupabaseAnonKey !== 'placeholder');
+
+const supabaseUrl = rawSupabaseUrl;
 const supabaseAnonKey =
-  rawSupabaseAnonKey?.trim() ||
+  rawSupabaseAnonKey ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder';
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
@@ -35,3 +42,4 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
 export function getSupabaseFunctionsUrl(): string {
   return `${supabaseUrl.replace(/\/+$/, '')}/functions/v1`;
 }
+

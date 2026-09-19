@@ -142,36 +142,24 @@ export interface UserDto {
 }
 
 export async function getMe(): Promise<UserDto | null> {
-  if (isSupabaseConfigured) {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return null;
-    return {
-      id: user.id,
-      googleUserId: user.user_metadata?.sub || user.id,
-      email: user.email || '',
-      displayName:
-        user.user_metadata?.full_name ||
-        user.user_metadata?.name ||
-        user.email?.split('@')[0] ||
-        'PriorityMail User',
-      avatarUrl: user.user_metadata?.avatar_url,
-      createdAt: user.created_at,
-    };
-  }
-
-  try {
-    return await apiFetch<UserDto>('/api/auth/me');
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401) return null;
-    throw e;
-  }
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+  return {
+    id: user.id,
+    googleUserId: user.user_metadata?.sub || user.id,
+    email: user.email || '',
+    displayName:
+      user.user_metadata?.full_name ||
+      user.user_metadata?.name ||
+      user.email?.split('@')[0] ||
+      'PriorityMail User',
+    avatarUrl: user.user_metadata?.avatar_url,
+    createdAt: user.created_at,
+  };
 }
 
 export function getDirectLoginUrl(): string {
-  if (isSupabaseConfigured) {
-    return `${getSupabaseFunctionsUrl()}/gmail-connect`;
-  }
-  return `${getApiBaseUrl()}/api/auth/google`;
+  return `${getSupabaseFunctionsUrl()}/gmail-connect`;
 }
 
 export async function getLoginUrl(): Promise<string> {
@@ -179,11 +167,7 @@ export async function getLoginUrl(): Promise<string> {
 }
 
 export async function logout(): Promise<void> {
-  if (isSupabaseConfigured) {
-    await supabase.auth.signOut();
-    return;
-  }
-  await apiFetch('/api/auth/logout', { method: 'POST' });
+  await supabase.auth.signOut();
 }
 
 // ----------------------------------------------------------------

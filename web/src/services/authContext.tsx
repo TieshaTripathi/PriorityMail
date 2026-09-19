@@ -5,9 +5,10 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { getMe, logout as apiLogout, getDirectLoginUrl, type UserDto } from './apiClient';
-import { supabase, isSupabaseConfigured } from './supabaseClient';
-import { getApiBaseUrl } from './apiUrl';
+import type { User } from '@supabase/supabase-js';
+import { supabase } from './supabaseClient.ts';
+import { getApiBaseUrl } from './apiUrl.ts';
+import type { UserDto } from './apiClient.ts';
 
 // ----------------------------------------------------------------
 // Types
@@ -21,10 +22,8 @@ export type AuthState =
 interface AuthContextValue {
   auth: AuthState;
   errorMessage: string | null;
-  serverReachable: boolean;
   apiBaseUrl: string;
-  /** Navigates to Google sign in. */
-  login: () => void;
+  login: () => Promise<void>;
   logout: () => Promise<void>;
   clearError: () => void;
 }
@@ -42,155 +41,179 @@ export function useAuth(): AuthContextValue {
 }
 
 // ----------------------------------------------------------------
+// Helper: Map Supabase User to UserDto
+// ----------------------------------------------------------------
+
+function mapSupabaseUser(sessionUser: User): UserDto {
+  return {
+    id: sessionUser.id,
+    googleUserId: sessionUser.user_metadata?.sub || sessionUser.id,
+    email: sessionUser.email || '',
+    displayName:
+      sessionUser.user_metadata?.full_name ||
+      sessionUser.user_metadata?.name ||
+      sessionUser.email?.split('@')[0] ||
+      'PriorityMail User',
+    avatarUrl: sessionUser.user_metadata?.avatar_url,
+    createdAt: sessionUser.created_at,
+  };
+}
+
+// ----------------------------------------------------------------
 // Provider
 // ----------------------------------------------------------------
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' });
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [serverReachable, setServerReachable] = useState<boolean>(true);
   const apiBaseUrl = getApiBaseUrl();
 
   useEffect(() => {
     let isMounted = true;
 
-    if (isSupabaseConfigured) {
-      // 1. Check existing Supabase session
-      supabase.auth.getSession().then(({ data: { session }, error }) => {
-        if (!isMounted) return;
-        if (error) {
-          console.warn('[auth] Supabase session error:', error);
+    // H. SAFE diagnostic logging (never logs tokens, secrets, or keys)
+    console.log('Supabase auth initialization');
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'unknown';
+    console.log('[auth] current origin:', origin);
+
+    // D. Check whether OAuth callback parameters or errors are present in the URL
+    const searchParams = new URLSearchParams(window.location.search);
+    const hash = typeof window !== 'undefined' ? window.location.hash || '' : '';
+    const hashParams = new URLSearchParams(hash.startsWith('#') ? hash.substring(1) : hash);
+
+    // Check for OAuth error returned from Google/Supabase in query or hash
+    const oauthError =
+      searchParams.get('error_description') ||
+      searchParams.get('error') ||
+      hashParams.get('error_description') ||
+      hashParams.get('error');
+
+    if (oauthError) {
+      console.log('[auth] OAuth error message:', oauthError);
+      const decoded = decodeURIComponent(oauthError.replace(/\+/g, ' '));
+      setErrorMessage(decoded);
+      setAuth({ status: 'unauthenticated' });
+      // Remove error parameters from URL
+      try {
+        window.history.replaceState({}, '', window.location.pathname);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
+    const hasAuthCallbackInUrl =
+      searchParams.has('code') ||
+      hash.includes('access_token=') ||
+      hash.includes('refresh_token=');
+
+    // Helper to clean URL after OAuth callback without disturbing app hash routing (#inbox, #all, etc.)
+    const cleanAuthParamsFromUrl = () => {
+      try {
+        const currentHash = window.location.hash || '';
+        const isAppHash =
+          currentHash.startsWith('#inbox') ||
+          currentHash.startsWith('#all') ||
+          currentHash.startsWith('#rules') ||
+          currentHash.startsWith('#people') ||
+          currentHash.startsWith('#settings') ||
+          currentHash.startsWith('#email');
+        const cleanUrl = window.location.pathname + (isAppHash ? currentHash : '');
+        window.history.replaceState({}, '', cleanUrl);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    // C. Register onAuthStateChange to immediately receive SIGNED_IN events
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!isMounted) return;
+
+      console.log('[auth] auth event name:', event);
+      console.log('[auth] session exists:', Boolean(session));
+
+      if (session?.user) {
+        const user = mapSupabaseUser(session.user);
+        setAuth({ status: 'authenticated', user });
+        setErrorMessage(null);
+        if (hasAuthCallbackInUrl) {
+          cleanAuthParamsFromUrl();
+        }
+      } else if (event === 'SIGNED_OUT') {
+        setAuth({ status: 'unauthenticated' });
+      } else if (event === 'INITIAL_SESSION' && !session) {
+        // If OAuth callback is actively in progress in the URL, wait for code exchange
+        if (!hasAuthCallbackInUrl) {
           setAuth({ status: 'unauthenticated' });
+        }
+      }
+    });
+
+    // B. On app startup: Call await supabase.auth.getSession() and wait for it
+    supabase.auth
+      .getSession()
+      .then(({ data: { session }, error }) => {
+        if (!isMounted) return;
+
+        console.log('[auth] session exists:', Boolean(session));
+
+        if (error) {
+          console.log('[auth] OAuth error message:', error.message);
+          // E. Temporary initialization/network error must not force login loop if callback is running
+          if (!hasAuthCallbackInUrl) {
+            setAuth({ status: 'unauthenticated' });
+          }
           return;
         }
 
         if (session?.user) {
-          const user: UserDto = {
-            id: session.user.id,
-            googleUserId: session.user.user_metadata?.sub || session.user.id,
-            email: session.user.email || '',
-            displayName:
-              session.user.user_metadata?.full_name ||
-              session.user.user_metadata?.name ||
-              session.user.email?.split('@')[0] ||
-              'PriorityMail User',
-            avatarUrl: session.user.user_metadata?.avatar_url,
-            createdAt: session.user.created_at,
-          };
+          const user = mapSupabaseUser(session.user);
           setAuth({ status: 'authenticated', user });
-        } else {
-          setAuth({ status: 'unauthenticated' });
-        }
-      });
-
-      // 2. Subscribe to Supabase auth state changes
-      const { data: { subscription } } = supabase.auth.onAuthStateChange(
-        (_event, session) => {
-          if (!isMounted) return;
-          if (session?.user) {
-            const user: UserDto = {
-              id: session.user.id,
-              googleUserId: session.user.user_metadata?.sub || session.user.id,
-              email: session.user.email || '',
-              displayName:
-                session.user.user_metadata?.full_name ||
-                session.user.user_metadata?.name ||
-                session.user.email?.split('@')[0] ||
-                'PriorityMail User',
-              avatarUrl: session.user.user_metadata?.avatar_url,
-              createdAt: session.user.created_at,
-            };
-            setAuth({ status: 'authenticated', user });
-          } else {
-            setAuth({ status: 'unauthenticated' });
+          setErrorMessage(null);
+          if (hasAuthCallbackInUrl) {
+            cleanAuthParamsFromUrl();
           }
-        }
-      );
-
-      return () => {
-        isMounted = false;
-        subscription.unsubscribe();
-      };
-    }
-
-    // Fallback: legacy session check
-    getMe()
-      .then((user) => {
-        if (!isMounted) return;
-        setServerReachable(true);
-        if (user) {
-          setAuth({ status: 'authenticated', user });
-        } else {
+        } else if (!hasAuthCallbackInUrl) {
+          // Decided unauthenticated only when no session and no pending OAuth callback in URL
           setAuth({ status: 'unauthenticated' });
         }
       })
       .catch((err) => {
         if (!isMounted) return;
-        console.warn('[auth] Session check failed:', err);
-        setServerReachable(false);
-        setAuth({ status: 'unauthenticated' });
+        console.warn('[auth] getSession error:', err);
+        if (!hasAuthCallbackInUrl) {
+          setAuth({ status: 'unauthenticated' });
+        }
       });
 
     return () => {
       isMounted = false;
+      subscription.unsubscribe();
     };
   }, []);
 
-  // Handle URL errors or success query params
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const authResult = params.get('auth');
-    const authError = params.get('auth_error');
-
-    if (authResult === 'success') {
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
-      setErrorMessage(null);
-      getMe().then((user) => {
-        if (user) setAuth({ status: 'authenticated', user });
-      });
-    } else if (authError) {
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
-      let humanMsg = 'Authentication could not be completed.';
-      if (authError === 'oauth_not_configured') {
-        humanMsg = 'PriorityMail authentication is not configured.';
-      } else if (authError === 'access_denied') {
-        humanMsg = 'Google sign-in was cancelled or access was denied.';
-      } else if (authError === 'server_error') {
-        humanMsg = 'Could not connect to PriorityMail authentication server.';
-      } else if (authError === 'session_expired') {
-        humanMsg = 'Your session expired. Please sign in again.';
-      }
-      setErrorMessage(humanMsg);
-      setAuth({ status: 'unauthenticated' });
-    }
-  }, []);
-
+  // A. Google login uses Supabase only
   const login = async () => {
-    if (isSupabaseConfigured) {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: window.location.origin,
-          queryParams: {
-            prompt: 'select_account',
-          },
-        },
-      });
-      if (error) {
-        setErrorMessage(error.message);
-      }
-      return;
+    clearError();
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: window.location.origin,
+      },
+    });
+    if (error) {
+      console.log('[auth] OAuth error message:', error.message);
+      setErrorMessage(error.message);
     }
-
-    const targetUrl = getDirectLoginUrl();
-    window.location.assign(targetUrl);
   };
 
   const logout = async () => {
     try {
-      await apiLogout();
-    } catch {
-      /* ignore network errors on logout */
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.warn('[auth] signOut error:', err);
     }
     setAuth({ status: 'unauthenticated' });
   };
@@ -204,7 +227,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       value={{
         auth,
         errorMessage,
-        serverReachable,
         apiBaseUrl,
         login,
         logout,
