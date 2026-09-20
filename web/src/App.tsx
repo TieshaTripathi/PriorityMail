@@ -272,8 +272,8 @@ function AppInner() {
     try {
       const url = await startConnectGmailAccount();
       window.location.assign(url);
-    } catch {
-      setToast('Could not start Gmail connection. Check backend connection.');
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Could not start Gmail connection.');
       setConnectingGoogle(false);
     }
   };

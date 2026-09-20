@@ -189,29 +189,39 @@ export async function getConnectedAccounts(): Promise<ConnectedAccountDto[]> {
   return apiFetch<ConnectedAccountDto[]>('/api/accounts');
 }
 
-export function getDirectConnectGmailUrl(): string {
-  if (isSupabaseConfigured) {
-    return `${getSupabaseFunctionsUrl()}/gmail-connect`;
-  }
-  return `${getApiBaseUrl()}/api/accounts/google/connect`;
-}
-
 export async function startConnectGmailAccount(): Promise<string> {
-  if (isSupabaseConfigured) {
-    const data = await apiFetch<{ url: string }>('/api/accounts/connect/start', {
-      method: 'POST',
-    });
-    if (data.url) return data.url;
+  const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+  if (sessionError) throw sessionError;
+  if (!session?.access_token) {
+    throw new Error('Please sign in before connecting Gmail.');
   }
+
+  const { data, error } = await supabase.functions.invoke('gmail-connect', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${session.access_token}` },
+  });
+  if (error) {
+    // Surface the function's JSON error without displaying headers or tokens.
+    if (error.context instanceof Response) {
+      const body = await error.context.json().catch(() => null);
+      const message = body?.error || body?.message;
+      if (typeof message === 'string') throw new Error(message);
+    }
+    throw error;
+  }
+
+  // The repository's gmail-connect function returns { url, state }.
+  // Never navigate to the Edge Function itself, including on malformed responses.
+  let url: URL;
   try {
-    const data = await apiFetch<{ url: string }>('/api/accounts/connect/start', {
-      method: 'POST',
-    });
-    if (data.url) return data.url;
+    url = new URL(data?.url);
   } catch {
-    // Fall back to direct navigation if JSON endpoint is unavailable
+    throw new Error('Gmail connection did not return a valid Google authorization URL.');
   }
-  return getDirectConnectGmailUrl();
+  if (url.origin !== 'https://accounts.google.com') {
+    throw new Error('Gmail connection returned an unexpected authorization URL.');
+  }
+  return url.href;
 }
 
 export async function disconnectAccount(accountId: string): Promise<void> {

@@ -26,10 +26,10 @@ export function ConnectedAccountsList({
     setConnecting(true);
     try {
       const url = await startConnectGmailAccount();
-      // Open Gmail OAuth in the same tab so session cookies work
+      // Navigate only after the authenticated function returns Google's consent URL.
       window.location.assign(url);
-    } catch {
-      onToast('Could not start Gmail connection. Is the backend running?');
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : 'Could not start Gmail connection.');
       setConnecting(false);
     }
   };
