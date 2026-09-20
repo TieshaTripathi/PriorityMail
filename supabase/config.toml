@@ -4,6 +4,11 @@
 # working directory name when running `supabase init`.
 project_id = "personal-email-priority-assistant"
 
+# Google redirects here without a Supabase bearer token. The handler verifies
+# the HMAC-signed, expiring OAuth state before exchanging the authorization code.
+[functions.gmail-callback]
+verify_jwt = false
+
 [api]
 enabled = true
 # Port to use for the API URL.

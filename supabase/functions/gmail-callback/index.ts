@@ -26,7 +26,7 @@ serve(async (req: Request) => {
 
   if (oauthError || !code || !state) {
     console.error('[gmail-callback] OAuth error or missing code/state:', oauthError);
-    return Response.redirect(`${frontendUrl}/#settings?connect_error=access_denied`, 302);
+    return Response.redirect(`${frontendUrl}/?connect_error=access_denied#settings`, 302);
   }
 
   try {
@@ -150,9 +150,9 @@ serve(async (req: Request) => {
       }
     }
 
-    return Response.redirect(`${frontendUrl}/#settings?connect_success=1`, 302);
+    return Response.redirect(`${frontendUrl}/?connect_success=1#settings`, 302);
   } catch (err) {
     console.error('[gmail-callback] Error processing callback:', err);
-    return Response.redirect(`${frontendUrl}/#settings?connect_error=server_error`, 302);
+    return Response.redirect(`${frontendUrl}/?connect_error=server_error#settings`, 302);
   }
 });
