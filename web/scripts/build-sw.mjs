@@ -11,5 +11,6 @@ const hash = createHash('sha256');
 for (const p of paths.sort()) hash.update(await readFile(p));
 const shell = paths.map(p => '/' + path.relative('dist', p).replaceAll('\\', '/'));
 const template = await readFile('scripts/sw-template.js', 'utf8');
+hash.update(template); // Worker-only fixes must change the cache version too.
 await writeFile('dist/sw.js', template.replace('__CACHE__', `prioritymail-${hash.digest('hex').slice(0, 12)}`).replace('__SHELL__', JSON.stringify([...shell, '/'])));
 console.log('Generated versioned offline service worker.');

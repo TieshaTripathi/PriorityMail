@@ -1,11 +1,27 @@
+// Click contract v2: absolute, same-origin PriorityMail detail URLs.
+function notificationTarget(data = {}) {
+  const home = new URL('/', self.location.origin);
+  try {
+    const emailId = data.emailId || data.internalEmailId;
+    if (typeof emailId === 'string' && emailId) {
+      home.searchParams.set('email', emailId);
+      return home.href;
+    }
+    const candidate = new URL(data.url || data.route || '/', home);
+    return candidate.origin === home.origin && candidate.pathname === '/' ? candidate.href : home.href;
+  } catch {
+    return home.href;
+  }
+}
+
 const CACHE = '__CACHE__';
 const SHELL = __SHELL__;
 
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)));
+  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
 
-// Updates wait until all old tabs close so old and new bundles never mix.
+// This click-handler update supports both old and new payloads; activate after precaching.
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(keys =>
@@ -38,17 +54,16 @@ self.addEventListener('push', event => {
   const subject = payload.subject || 'Action required';
   const reason = payload.reason ? `\nReason: ${payload.reason}` : '';
   const body = payload.body || `${sender}\n${subject}${reason}`;
-  const emailId = payload.emailId || payload.internalEmailId || '';
+  // Accept the new nested data contract and existing queued flat payloads.
+  const data = payload.data && typeof payload.data === 'object' ? payload.data : payload;
+  const emailId = data.emailId || data.internalEmailId || '';
 
   const options = {
     body,
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
     tag: emailId || 'prioritymail',
-    data: {
-      ...payload,
-      url: emailId ? '/?email=' + encodeURIComponent(emailId) : '/',
-    },
+    data: { ...data, url: notificationTarget(data) },
   };
 
   event.waitUntil(Promise.all([
@@ -61,20 +76,34 @@ self.addEventListener('push', event => {
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  const data = event.notification.data || {};
-  const id = data.emailId || data.internalEmailId;
-  const targetUrl = (id ? '/?email=' + encodeURIComponent(id) : data.url) || '/';
-  const candidate = new URL(targetUrl, self.location.origin);
-  const url = candidate.origin === self.location.origin ? candidate.href : self.location.origin;
-
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async clients => {
-      const client = clients.find(c => new URL(c.url).origin === self.location.origin);
-      if (client) {
-        await client.navigate(url);
-        return client.focus();
+  event.waitUntil((async () => {
+    const url = notificationTarget(event.notification.data || {});
+    let windows = [];
+    try {
+      windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    } catch {
+      // A client enumeration failure must not prevent opening the app.
+    }
+    for (const client of windows) {
+      try {
+        if (new URL(client.url).origin !== self.location.origin) continue;
+        if (typeof client.navigate !== 'function' || typeof client.focus !== 'function') continue;
+        const navigated = await client.navigate(url);
+        // navigate() can return null for a window that closed during the click.
+        if (!navigated) continue;
+        await navigated.focus();
+        return;
+      } catch {
+        // Try another app window, then fall back to opening a new one.
       }
-      return self.clients.openWindow(url);
-    })
-  );
+    }
+    if (self.clients.openWindow) {
+      try {
+        const opened = await self.clients.openWindow(url);
+        if (opened && typeof opened.focus === 'function') await opened.focus();
+      } catch {
+        console.warn('[prioritymail-sw] notification navigation failed');
+      }
+    }
+  })());
 });

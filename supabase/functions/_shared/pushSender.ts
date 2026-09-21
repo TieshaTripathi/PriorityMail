@@ -3,6 +3,7 @@
 
 import webpush from 'npm:web-push@3.6.7';
 import { getAdminClient } from './supabaseClient.ts';
+import { notificationClickData } from './notificationClickData.ts';
 
 export interface NotificationPayload {
   internalEmailId: string;
@@ -83,7 +84,11 @@ export async function sendPushToUser(
               auth: sub.auth,
             },
           },
-          JSON.stringify(fullPayload)
+          JSON.stringify({
+            ...fullPayload,
+            icon: '/icons/icon-192.png',
+            data: notificationClickData(payload),
+          })
         );
         pwaSent++;
       } catch (err: unknown) {

@@ -52,7 +52,7 @@ test('focus and visible events refetch newly persisted emails and cleanup listen
 for (const path of ['scripts/sw-template.js', 'public/sw.js']) {
   test(`${path}: notification click uses UUID query route in existing and new windows`, async () => {
     const listeners = {}; let notification; let navigated; let focused = false; let opened;
-    let windows = [{ url: 'https://priority.test/', navigate: async url => navigated = url, focus: async () => focused = true }];
+    let windows = [{ url: 'https://priority.test/', navigate: async url => { navigated = url; return windows[0]; }, focus: async () => focused = true }];
     const self = { location: { origin: 'https://priority.test' }, addEventListener: (name, fn) => listeners[name] = fn,
       registration: { showNotification: async (_, options) => notification = options },
       clients: { matchAll: async () => windows, openWindow: async url => opened = url } };
