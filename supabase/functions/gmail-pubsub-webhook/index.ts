@@ -1,3 +1,4 @@
+import { persistEmailIdentity } from '../_shared/emailPersistence.ts';
 // PriorityMail Edge Function: gmail-pubsub-webhook
 // Receives real-time Gmail push notifications from Google Cloud Pub/Sub,
 // fetches history, classifies new messages, and dispatches push notifications.
@@ -213,12 +214,6 @@ async function handleRequest(req: Request, log: (stage: string, metadata?: Recor
         continue;
       }
 
-      // Record dedup key
-      await adminClient.from('notification_history').insert({
-        user_id: userId,
-        gmail_message_id: msgId,
-      });
-
       // 7. Fetch full message
       const rawEmail = await getMessage(accessToken, msgId, account.id, account.email);
 
@@ -240,7 +235,7 @@ async function handleRequest(req: Request, log: (stage: string, metadata?: Recor
       log('priority-result', { priority: result.priority, category: result.category });
 
       // Persist email metadata
-      await adminClient.from('email_metadata').upsert(
+      const identity = await persistEmailIdentity(adminClient,
         {
           user_id: userId,
           connected_account_id: account.id,
@@ -262,10 +257,20 @@ async function handleRequest(req: Request, log: (stage: string, metadata?: Recor
           category: result.category,
           reasons: result.reasons,
           action_required: result.actionRequired,
+          deadline: null, // The classifier does not extract a trustworthy timestamp.
           updated_at: new Date().toISOString(),
         },
-        { onConflict: 'user_id,gmail_message_id' }
       );
+
+      // Claim the existing unique dedup key only after persistence succeeds.
+      const { error: dedupError } = await adminClient.from('notification_history').insert({
+        user_id: userId,
+        gmail_message_id: msgId,
+      });
+      if (dedupError) {
+        log('push-decision', { decision: 'skip', reason: 'dedup-claim-not-acquired' });
+        continue;
+      }
 
       // 9. Notification Decision Gate
       if (!settings.notifications_enabled) {
@@ -313,9 +318,7 @@ async function handleRequest(req: Request, log: (stage: string, metadata?: Recor
 
       // 10. Send notification
       const payload: NotificationPayload = {
-        internalEmailId: rawEmail.gmailMessageId,
-        gmailMessageId: rawEmail.gmailMessageId,
-        gmailThreadId: rawEmail.gmailThreadId,
+        ...identity,
         accountEmail: rawEmail.accountEmail,
         senderName: rawEmail.senderName || 'Unknown Sender',
         subject: rawEmail.subject || '(No Subject)',

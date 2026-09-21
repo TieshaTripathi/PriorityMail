@@ -6,6 +6,9 @@ import { getAdminClient } from './supabaseClient.ts';
 
 export interface NotificationPayload {
   internalEmailId: string;
+  emailId?: string;
+  connectedAccountId?: string;
+  route?: string;
   gmailMessageId: string;
   gmailThreadId: string;
   accountEmail: string;

@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { subscribeInboxRefresh } from './services/inboxRefresh';
+import { loadLatestEmails, loadEmailById, newestFirst, plainEmailPreview } from './services/emailStore';
+import { useEffect, useMemo, useState, useRef, useCallback, type FormEvent } from 'react';
 import { EmailCard, PriorityBadge } from './components/EmailCard';
 import { Icon, type IconName } from './components/Icon';
 import { Modal } from './components/Modal';
@@ -19,8 +21,6 @@ import { TermsPage } from './pages/TermsPage';
 import { ConnectedAccountsList } from './components/ConnectedAccountsList';
 import {
   getConnectedAccounts,
-  fetchGmailMessages,
-  fetchAllGmailMessages,
   syncGmailAccount,
   syncAllGmailAccounts,
   startConnectGmailAccount,
@@ -91,6 +91,8 @@ const validSettings = (x: unknown): x is Settings =>
 const newId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function route() {
+  const emailId = new URLSearchParams(window.location.search).get('email');
+  if (emailId) return { tab: 'inbox' as Tab, detail: emailId };
   const hash = window.location.hash.slice(1);
   if (hash.startsWith('email/')) {
     try {
@@ -180,7 +182,7 @@ function gmailDtoToEmail(dto: GmailEmailDto): PriorityEmail {
     reason: dto.reason,
     reasons: dto.reasons && dto.reasons.length > 0 ? dto.reasons : [dto.reason || 'Flagged by PriorityMail'],
     score: dto.score,
-    deadline: hasDeadline ? 'Deadline detected' : undefined,
+    deadline: dto.deadline || (hasDeadline ? 'Deadline detected' : undefined),
   };
 }
 
@@ -223,28 +225,56 @@ function AppInner() {
 
   const tab = location.tab;
 
-  const fetchRealEmails = async (targetAccountId: string = account) => {
+  const refreshGeneration = useRef(0);
+  const accountRef = useRef(account);
+  accountRef.current = account;
+  const [detailEmail, setDetailEmail] = useState<GmailEmailDto | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const fetchRealEmails = useCallback(async (targetAccountId = accountRef.current) => {
+    const generation = ++refreshGeneration.current;
     setGmailLoading(true);
-    setGmailError('');
     try {
-      if (targetAccountId === 'all') {
-        const result = await fetchAllGmailMessages(30);
-        setGmailEmails(result.emails);
-        if (result.emails.length > 0) {
-          setToast(`Synced ${result.emails.length} emails across connected accounts.`);
-        }
-      } else {
-        const result = await fetchGmailMessages(targetAccountId, 25);
-        setGmailEmails(result.emails);
-        setToast(`Synced ${result.emails.length} emails from ${result.accountEmail}.`);
+      const emails = await loadLatestEmails(targetAccountId);
+      if (generation === refreshGeneration.current && targetAccountId === accountRef.current) {
+        setGmailEmails(newestFirst(emails));
+        setGmailError('');
       }
     } catch (err) {
-      console.error('[App] fetchRealEmails error:', err);
-      setGmailError(err instanceof Error ? err.message : 'Could not fetch Gmail messages.');
+      if (generation === refreshGeneration.current) setGmailError(err instanceof Error ? err.message : 'Could not fetch email.');
     } finally {
-      setGmailLoading(false);
+      if (generation === refreshGeneration.current) setGmailLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void fetchRealEmails(account);
+  }, [account, fetchRealEmails]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeInboxRefresh(() => { void fetchRealEmails(); }, window, document, navigator.serviceWorker);
+    return () => {
+      unsubscribe();
+      ++refreshGeneration.current;
+    };
+  }, [fetchRealEmails]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDetailEmail(null);
+    setDetailError('');
+    if (!location.detail) { setDetailLoading(false); return; }
+    void fetchRealEmails();
+    if (gmailEmails.some(email => email.id === location.detail)) { setDetailLoading(false); return; }
+    setDetailLoading(true);
+    loadEmailById(location.detail).then(email => {
+      if (!cancelled) setDetailEmail(email);
+    }).catch(() => {
+      if (!cancelled) setDetailError('Could not load this email. Please try again.');
+    }).finally(() => { if (!cancelled) setDetailLoading(false); });
+    return () => { cancelled = true; };
+    // Route changes trigger a lookup independent of the current inbox page.
+  }, [location.detail, user?.id, fetchRealEmails]);
 
   const handleManualSync = async () => {
     setGmailSyncing(true);
@@ -350,6 +380,7 @@ function AppInner() {
     const updated = () => setUpdateReady(true);
     const failed = () => setOfflineError(true);
     window.addEventListener('hashchange', change);
+    window.addEventListener('popstate', change);
     window.addEventListener('online', connection);
     window.addEventListener('offline', connection);
     window.addEventListener('beforeinstallprompt', install);
@@ -359,6 +390,7 @@ function AppInner() {
     const timer = window.setInterval(refresh, 30000);
     return () => {
       window.removeEventListener('hashchange', change);
+      window.removeEventListener('popstate', change);
       window.removeEventListener('online', connection);
       window.removeEventListener('offline', connection);
       window.removeEventListener('beforeinstallprompt', install);
@@ -459,7 +491,8 @@ function AppInner() {
     });
   }, [tab, activePriorityEmails, emailsForAccount, filter, status, search]);
 
-  const selected = baseEmails.find(e => e.id === location.detail);
+  const selected = baseEmails.find(e => e.id === location.detail) ||
+    (detailEmail?.id === location.detail ? gmailDtoToEmail(detailEmail) : undefined);
 
   const complete = (id: string) => {
     setDone(ids => (ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id]));
@@ -468,18 +501,21 @@ function AppInner() {
 
   const open = (id: string) => {
     setRead(ids => (ids.includes(id) ? ids : [...ids, id]));
-    window.location.hash = `email/${encodeURIComponent(id)}`;
+    window.history.pushState({}, '', `/?email=${encodeURIComponent(id)}`);
+    setLocation(route());
   };
 
   const navigate = (next: Tab) => {
     setSearch('');
     setFilter('all');
     setStatus('all');
-    window.location.hash = next;
+    window.history.pushState({}, '', `/#${next}`);
+    setLocation(route());
   };
 
   const closeDetail = () => {
-    window.location.hash = tab === 'all' ? 'all' : 'inbox';
+    window.history.pushState({}, '', `/#${tab === 'all' ? 'all' : 'inbox'}`);
+    setLocation(route());
   };
 
   const snooze = (date: Date) => {
@@ -1284,7 +1320,7 @@ function AppInner() {
                   ))}
                 </ul>
               </section>
-              <p className="email-body">{selected.body || selected.snippet}</p>
+              <p className="email-body">{plainEmailPreview(selected.body || selected.snippet)}</p>
 
               {/* DYNAMIC OPEN IN GMAIL â€” EXACT ACCOUNT & THREAD */}
               <button
@@ -1341,7 +1377,7 @@ function AppInner() {
               )}
             </>
           ) : (
-            <EmptyState title="Email not found" body="This message is not in the current inbox." />
+            <EmptyState title={detailLoading ? "Loading email…" : "Email not found"} body={detailLoading ? "Fetching this message securely…" : detailError || "This message is unavailable for your account."} />
           )}
         </Modal>
       )}
@@ -1521,5 +1557,5 @@ function AuthGate() {
     return <LoginPage />;
   }
 
-  return <AppInner />;
+  return <AppInner key={auth.user.id} />;
 }

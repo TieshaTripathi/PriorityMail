@@ -185,10 +185,10 @@ async function fetchAccountEmails(
     };
   });
 
-  // Persist email metadata in background
-  Promise.resolve().then(async () => {
+  // Await persistence so a subsequent metadata refresh sees the completed sync.
+  {
     for (const em of classified) {
-      await adminClient.from('email_metadata').upsert(
+      const { data: saved, error } = await adminClient.from('email_metadata').upsert(
         {
           user_id: userId,
           connected_account_id: accountId,
@@ -210,11 +210,13 @@ async function fetchAccountEmails(
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'user_id,gmail_message_id' }
-      );
+      ).select('id').single();
+      if (error || !saved) throw new Error('Could not persist Gmail metadata');
+      em.id = saved.id;
     }
-  }).catch((e) => console.warn('[gmail-messages] Metadata persistence notice:', e));
+  }
 
-  classified.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  classified.sort((a, b) => Date.parse(b.receivedAt) - Date.parse(a.receivedAt));
   return { emails: classified, accountId, accountEmail: auth.email };
 }
 
@@ -261,7 +263,7 @@ serve(async (req: Request) => {
       .filter((r): r is NonNullable<typeof r> => r !== null)
       .flatMap((r) => r.emails);
 
-    allEmails.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    allEmails.sort((a, b) => Date.parse(b.receivedAt) - Date.parse(a.receivedAt));
 
     return jsonResponse({ emails: allEmails, accounts });
   } catch (err: unknown) {

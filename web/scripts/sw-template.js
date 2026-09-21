@@ -38,7 +38,7 @@ self.addEventListener('push', event => {
   const subject = payload.subject || 'Action required';
   const reason = payload.reason ? `\nReason: ${payload.reason}` : '';
   const body = payload.body || `${sender}\n${subject}${reason}`;
-  const emailId = payload.internalEmailId || payload.gmailMessageId || '';
+  const emailId = payload.emailId || payload.internalEmailId || '';
 
   const options = {
     body,
@@ -46,17 +46,24 @@ self.addEventListener('push', event => {
     badge: '/icons/icon-192.png',
     tag: emailId || 'prioritymail',
     data: {
-      url: emailId ? '/#email/' + encodeURIComponent(emailId) : '/',
       ...payload,
+      url: emailId ? '/?email=' + encodeURIComponent(emailId) : '/',
     },
   };
 
-  event.waitUntil(self.registration.showNotification(title, options));
+  event.waitUntil(Promise.all([
+    self.registration.showNotification(title, options),
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+      for (const client of clients) client.postMessage?.({ type: 'prioritymail-inbox-refresh' });
+    }),
+  ]));
 });
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  const targetUrl = event.notification.data?.url || '/';
+  const data = event.notification.data || {};
+  const id = data.emailId || data.internalEmailId;
+  const targetUrl = (id ? '/?email=' + encodeURIComponent(id) : data.url) || '/';
   const candidate = new URL(targetUrl, self.location.origin);
   const url = candidate.origin === self.location.origin ? candidate.href : self.location.origin;
 
