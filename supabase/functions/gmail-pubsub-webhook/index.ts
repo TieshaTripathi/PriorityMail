@@ -4,6 +4,7 @@
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { handleCors, jsonResponse } from '../_shared/cors.ts';
+import { verifyPubSubSender, parseGmailPush } from '../_shared/pubsubAuth.ts';
 import { getAdminClient } from '../_shared/supabaseClient.ts';
 import { decrypt, encrypt } from '../_shared/crypto.ts';
 import { refreshGoogleToken } from '../_shared/googleAuth.ts';
@@ -15,20 +16,6 @@ import {
   type PrioritySensitivity,
 } from '../_shared/priorityEngine.ts';
 import { sendPushToUser, type NotificationPayload } from '../_shared/pushSender.ts';
-
-interface PubSubRequestBody {
-  message?: {
-    data?: string;
-    messageId?: string;
-    publishTime?: string;
-  };
-  subscription?: string;
-}
-
-interface GmailPubSubPayload {
-  emailAddress?: string;
-  historyId?: string;
-}
 
 function isQuietHours(settings: {
   quiet_hours_enabled: boolean;
@@ -56,31 +43,21 @@ serve(async (req: Request) => {
   const corsRes = handleCors(req);
   if (corsRes) return corsRes;
 
-  // Always return 200 to Pub/Sub to prevent endless re-delivery
-  let body: PubSubRequestBody;
+  if (req.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
+
+  let eventData: { emailAddress: string; historyId: string };
   try {
-    body = await req.json();
+    eventData = parseGmailPush(await req.json());
   } catch {
-    return jsonResponse({ status: 'ignored', reason: 'invalid json' }, 200);
+    return jsonResponse({ error: 'Invalid Pub/Sub payload' }, 400);
   }
-
-  if (!body?.message?.data) {
-    return jsonResponse({ status: 'ignored', reason: 'no data in message' }, 200);
-  }
-
-  let eventData: GmailPubSubPayload;
   try {
-    const raw = atob(body.message.data);
-    eventData = JSON.parse(raw);
-  } catch (err) {
-    console.error('[gmail-pubsub-webhook] Error decoding payload:', err);
-    return jsonResponse({ status: 'ignored', reason: 'malformed data' }, 200);
+    await verifyPubSubSender(req);
+  } catch {
+    // Do not log bearer tokens or expose verification internals.
+    return jsonResponse({ error: 'Pub/Sub sender verification failed' }, 401);
   }
-
   const { emailAddress, historyId: incomingHistoryId } = eventData;
-  if (!emailAddress || !incomingHistoryId) {
-    return jsonResponse({ status: 'ignored', reason: 'missing emailAddress or historyId' }, 200);
-  }
 
   console.log(`[gmail-pubsub-webhook] Event for ${emailAddress} (historyId: ${incomingHistoryId})`);
 
@@ -90,7 +67,7 @@ serve(async (req: Request) => {
   const { data: account } = await adminClient
     .from('connected_google_accounts')
     .select('id, user_id, email')
-    .ilike('email', emailAddress)
+    .ilike('email', emailAddress.replace(/[\\%_]/g, '\\$&'))
     .maybeSingle();
 
   if (!account) {
@@ -106,6 +83,12 @@ serve(async (req: Request) => {
     .select('id, history_id')
     .eq('connected_account_id', account.id)
     .maybeSingle();
+
+  // Acknowledge notifications already covered by the stored Gmail history cursor.
+  if (watchState?.history_id && /^[0-9]+$/.test(watchState.history_id) &&
+      BigInt(incomingHistoryId) <= BigInt(watchState.history_id)) {
+    return jsonResponse({ status: 'ignored', reason: 'history already processed' }, 200);
+  }
 
   const startHistoryId = watchState?.history_id || incomingHistoryId;
 

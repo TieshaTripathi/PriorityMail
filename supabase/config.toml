@@ -9,6 +9,10 @@ project_id = "personal-email-priority-assistant"
 [functions.gmail-callback]
 verify_jwt = false
 
+# Pub/Sub uses a Google OIDC token, verified inside the webhook.
+[functions.gmail-pubsub-webhook]
+verify_jwt = false
+
 [api]
 enabled = true
 # Port to use for the API URL.
