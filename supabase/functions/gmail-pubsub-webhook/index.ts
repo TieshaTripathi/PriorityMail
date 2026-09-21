@@ -4,7 +4,7 @@
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { handleCors, jsonResponse } from '../_shared/cors.ts';
-import { verifyPubSubSender, parseGmailPush } from '../_shared/pubsubAuth.ts';
+import { verifyPubSubSender, parseGmailPush, PubSubValidationError } from '../_shared/pubsubAuth.ts';
 import { getAdminClient } from '../_shared/supabaseClient.ts';
 import { decrypt, encrypt } from '../_shared/crypto.ts';
 import { refreshGoogleToken } from '../_shared/googleAuth.ts';
@@ -39,42 +39,53 @@ function isQuietHours(settings: {
   return currentMinutes >= startTotal || currentMinutes < endTotal;
 }
 
-serve(async (req: Request) => {
+async function handleRequest(req: Request, log: (stage: string, metadata?: Record<string, unknown>, rejected?: boolean) => void) {
   const corsRes = handleCors(req);
   if (corsRes) return corsRes;
 
-  if (req.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
+  if (req.method !== 'POST') {
+    log('request-method', { reason: 'method-not-allowed', status: 405 }, true);
+    return jsonResponse({ error: 'Method not allowed' }, 405);
+  }
 
   let eventData: { emailAddress: string; historyId: string };
   try {
-    eventData = parseGmailPush(await req.json());
-  } catch {
+    eventData = parseGmailPush(await req.json(), log);
+  } catch (error) {
+    log(error instanceof PubSubValidationError ? error.stage : 'parse-envelope', {
+      reason: error instanceof PubSubValidationError ? error.reason : 'request-body-not-json', status: 400,
+    }, true);
     return jsonResponse({ error: 'Invalid Pub/Sub payload' }, 400);
   }
   try {
-    await verifyPubSubSender(req);
-  } catch {
+    await verifyPubSubSender(req, log);
+  } catch (error) {
+    log('jwt-verification', {
+      reason: error instanceof PubSubValidationError ? error.reason : 'sender-verification-failed', status: 401,
+    }, true);
     // Do not log bearer tokens or expose verification internals.
     return jsonResponse({ error: 'Pub/Sub sender verification failed' }, 401);
   }
   const { emailAddress, historyId: incomingHistoryId } = eventData;
 
-  console.log(`[gmail-pubsub-webhook] Event for ${emailAddress} (historyId: ${incomingHistoryId})`);
+  log('gmail-email-address-resolved', { emailAddress });
+  log('history-id-received', { historyId: incomingHistoryId });
 
   const adminClient = getAdminClient();
 
   // 1. Locate the connected account and owner user
-  const { data: account } = await adminClient
+  const { data: account, error: accountError } = await adminClient
     .from('connected_google_accounts')
     .select('id, user_id, email')
     .ilike('email', emailAddress.replace(/[\\%_]/g, '\\$&'))
     .maybeSingle();
 
   if (!account) {
-    console.log(`[gmail-pubsub-webhook] No connected account registered for: ${emailAddress}`);
+    log('account-resolution', { reason: accountError ? 'account-lookup-failed' : 'account-not-registered', status: 200 }, true);
     return jsonResponse({ status: 'ignored', reason: 'account not registered' }, 200);
   }
 
+  log('connected-account-found', { connected_account_id: account.id });
   const userId = account.user_id;
 
   // 2. Fetch watch state and previous historyId
@@ -87,6 +98,7 @@ serve(async (req: Request) => {
   // Acknowledge notifications already covered by the stored Gmail history cursor.
   if (watchState?.history_id && /^[0-9]+$/.test(watchState.history_id) &&
       BigInt(incomingHistoryId) <= BigInt(watchState.history_id)) {
+    log('deduplication', { reason: 'history-already-processed', status: 200 });
     return jsonResponse({ status: 'ignored', reason: 'history already processed' }, 200);
   }
 
@@ -100,6 +112,7 @@ serve(async (req: Request) => {
     .maybeSingle();
 
   if (!cred) {
+    log('credentials', { reason: 'credentials-missing', status: 200 }, true);
     return jsonResponse({ status: 'ignored', reason: 'credentials missing' }, 200);
   }
 
@@ -122,14 +135,17 @@ serve(async (req: Request) => {
         })
         .eq('connected_account_id', account.id);
     } catch (err) {
-      console.error('[gmail-pubsub-webhook] Token refresh failed:', err);
+      log('token-refresh', { reason: 'token-refresh-failed', status: 200 }, true);
       return jsonResponse({ status: 'error', reason: 'token refresh failed' }, 200);
     }
   }
 
   try {
     // 4. Fetch history since startHistoryId
+    log('gmail-history-processing-started', { historyId: startHistoryId });
     const { newMsgIds, latestHistoryId } = await listHistory(accessToken, startHistoryId);
+
+    log('gmail-history-fetched', { messageCount: newMsgIds.length });
 
     // Update watch state with new historyId
     const historyToStore = latestHistoryId || incomingHistoryId;
@@ -192,7 +208,10 @@ serve(async (req: Request) => {
         .eq('gmail_message_id', msgId)
         .maybeSingle();
 
-      if (alreadySent) continue;
+      if (alreadySent) {
+        log('push-decision', { decision: 'skip', reason: 'already-recorded' });
+        continue;
+      }
 
       // Record dedup key
       await adminClient.from('notification_history').insert({
@@ -217,6 +236,8 @@ serve(async (req: Request) => {
         vips,
         (settings.sensitivity as PrioritySensitivity) || 'Balanced'
       );
+
+      log('priority-result', { priority: result.priority, category: result.category });
 
       // Persist email metadata
       await adminClient.from('email_metadata').upsert(
@@ -248,10 +269,12 @@ serve(async (req: Request) => {
 
       // 9. Notification Decision Gate
       if (!settings.notifications_enabled) {
+        log('push-decision', { decision: 'skip', reason: 'notifications-disabled' });
         continue;
       }
 
       if (isQuietHours(settings)) {
+        log('push-decision', { decision: 'skip', reason: 'quiet-hours' });
         continue;
       }
 
@@ -264,9 +287,18 @@ serve(async (req: Request) => {
       const hasDeadline = result.reasons.some((r) => r.toLowerCase().includes('deadline'));
       const isAction = result.actionRequired;
 
-      if (isVip && !settings.vip_alerts) continue;
-      if (hasDeadline && !settings.deadline_alerts) continue;
-      if (isAction && !settings.action_alerts && !isVip) continue;
+      if (isVip && !settings.vip_alerts) {
+        log('push-decision', { decision: 'skip', reason: 'vip-alerts-disabled' });
+        continue;
+      }
+      if (hasDeadline && !settings.deadline_alerts) {
+        log('push-decision', { decision: 'skip', reason: 'deadline-alerts-disabled' });
+        continue;
+      }
+      if (isAction && !settings.action_alerts && !isVip) {
+        log('push-decision', { decision: 'skip', reason: 'action-alerts-disabled' });
+        continue;
+      }
 
       const isImportant =
         result.priority === 'urgent' ||
@@ -274,7 +306,10 @@ serve(async (req: Request) => {
         result.actionRequired ||
         (isVip && settings.vip_alerts);
 
-      if (!isImportant) continue;
+      if (!isImportant) {
+        log('push-decision', { decision: 'skip', reason: 'not-important' });
+        continue;
+      }
 
       // 10. Send notification
       const payload: NotificationPayload = {
@@ -289,7 +324,9 @@ serve(async (req: Request) => {
         category: result.category,
       };
 
+      log('push-decision', { decision: 'dispatch' });
       await sendPushToUser(userId, payload);
+      log('push-dispatch-returned');
       notificationsDispatched++;
     }
 
@@ -302,7 +339,25 @@ serve(async (req: Request) => {
       200
     );
   } catch (err) {
-    console.error('[gmail-pubsub-webhook] Error processing history:', err);
+    log('gmail-history-processing', { reason: 'history-processing-failed', status: 200 }, true);
     return jsonResponse({ status: 'error', error: String(err) }, 200);
+  }
+}
+
+serve(async (req: Request) => {
+  const requestId = crypto.randomUUID();
+  let lastStage = 'request-start';
+  const log = (stage: string, metadata: Record<string, unknown> = {}, rejected = false) => {
+    lastStage = stage;
+    const fields = { requestId, stage, ...metadata };
+    if (rejected) console.warn('[gmail-pubsub] rejected', fields);
+    else console.log('[gmail-pubsub] stage', fields);
+  };
+  try {
+    return await handleRequest(req, log);
+  } catch (error) {
+    log('unhandled-error', { reason: 'unhandled-function-error', afterStage: lastStage, status: 500 }, true);
+    // Preserve runtime error handling; never print the raw error or request.
+    throw new Error('Pub/Sub webhook processing failed');
   }
 });

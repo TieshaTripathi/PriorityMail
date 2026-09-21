@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseGmailPush, verifyPubSubSender } from './pubsubAuth.ts';
+import { parseGmailPush, verifyPubSubSender, PubSubValidationError } from './pubsubAuth.ts';
 
 const envelope = (data: unknown) => ({
   subscription: 'projects/test-project/subscriptions/gmail',
@@ -32,4 +32,26 @@ Deno.test('missing sender token and missing configuration fail closed', async ()
   } finally {
     if (previous !== undefined) Deno.env.set('PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL', previous);
   }
+});
+
+Deno.test('diagnostics identify validation stages without including raw input', () => {
+  const marker = 'DO-NOT-LOG-PRIVATE-CONTENT';
+  const cases: [unknown, string, string][] = [
+    [{}, 'parse-envelope', 'subscription-missing-or-invalid'],
+    [{ ...envelope({}), message: { messageId: '1', data: marker } }, 'decode-message', 'invalid-base64-encoding'],
+    [{ ...envelope({}), message: { messageId: '1', data: btoa(marker) } }, 'decode-message', 'decoded-data-not-json'],
+    [envelope({ emailAddress: 'test@example.com', historyId: 123, body: marker }), 'gmail-payload-validation', 'history-id-missing-or-not-digit-string'],
+  ];
+  for (const [body, stage, reason] of cases) {
+    assert.throws(() => parseGmailPush(body), (error: unknown) => {
+      assert.ok(error instanceof PubSubValidationError);
+      assert.equal(error.stage, stage);
+      assert.equal(error.reason, reason);
+      assert.ok(!JSON.stringify(error).includes(marker));
+      return true;
+    });
+  }
+  const stages: string[] = [];
+  parseGmailPush(envelope({ emailAddress: 'test@example.com', historyId: '123' }), stage => stages.push(stage));
+  assert.deepEqual(stages, ['pubsub-envelope-parsed', 'gmail-payload-decoded']);
 });
