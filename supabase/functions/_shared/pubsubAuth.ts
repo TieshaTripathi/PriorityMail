@@ -8,7 +8,7 @@ export class PubSubValidationError extends Error {
   }
 }
 
-type StageLog = (stage: string) => void;
+type StageLog = (stage: string, metadata?: Record<string, unknown>) => void;
 function fail(stage: string, reason: string, message: string): never {
   throw new PubSubValidationError(stage, reason, message);
 }
@@ -47,6 +47,17 @@ export async function verifyPubSubSender(req: Request, log: StageLog = () => {})
   }
 }
 
+export function normalizeHistoryId(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return /^[0-9]+$/.test(trimmed) ? trimmed : null;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return String(value);
+  }
+  return null;
+}
+
 export function parseGmailPush(body: unknown, log: StageLog = () => {}): { emailAddress: string; historyId: string } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) fail('parse-envelope', 'body-not-object', 'Invalid envelope');
   const envelope = body as Record<string, unknown>;
@@ -82,15 +93,19 @@ export function parseGmailPush(body: unknown, log: StageLog = () => {}): { email
   } catch {
     fail('decode-message', 'decoded-data-not-json', 'Invalid Gmail notification');
   }
-  log('gmail-payload-decoded');
+  log('gmail-payload-decoded', {
+    historyIdType: typeof event?.historyId,
+    historyIdPresent: event?.historyId != null,
+  });
   if (!event || typeof event !== 'object' || Array.isArray(event)) {
     fail('gmail-payload-validation', 'gmail-payload-not-object', 'Invalid Gmail notification');
   }
   if (typeof event.emailAddress !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(event.emailAddress)) {
     fail('gmail-payload-validation', 'email-address-missing-or-invalid', 'Invalid Gmail notification');
   }
-  if (typeof event.historyId !== 'string' || !/^[0-9]+$/.test(event.historyId)) {
-    fail('gmail-payload-validation', 'history-id-missing-or-not-digit-string', 'Invalid Gmail notification');
+  const historyId = normalizeHistoryId(event.historyId);
+  if (historyId === null) {
+    fail('gmail-payload-validation', 'history-id-missing-or-invalid-or-unsafe', 'Invalid Gmail notification');
   }
-  return { emailAddress: event.emailAddress, historyId: event.historyId };
+  return { emailAddress: event.emailAddress, historyId };
 }
